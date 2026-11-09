@@ -1,0 +1,6 @@
+node_modules/
+.aix/
+*.aix
+.env
+.env.*
+!.env.example

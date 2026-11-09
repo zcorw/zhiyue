@@ -1,0 +1,11 @@
+{
+  "name": "知阅",
+  "description": "用眼镜浏览知声文章、翻页和收听文章音频。",
+  "pages": ["pages/index/index", "pages/reader/index", "pages/pair/index"],
+  "permissions": ["INTERNET"],
+  "window": {
+    "navigationBarTitleText": "知阅",
+    "navigationBarBackgroundColor": "#000000",
+    "viewport": { "width": "device-width" }
+  }
+}

@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#080f0b">
+    <title>知阅 · 电脑预览</title>
+    <link rel="stylesheet" href="./styles.css">
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <main class="preview">
+      <header class="preview-header">
+        <h1>知阅</h1>
+        <p class="preview-label">电脑预览</p>
+      </header>
+
+      <div class="display">
+        <section id="library" aria-labelledby="library-title">
+          <header class="display-header">
+            <h2 id="library-title" tabindex="-1">全部文章</h2>
+            <span id="article-count" class="quiet"></span>
+          </header>
+          <ol id="article-list" class="article-list"></ol>
+          <p id="library-status" class="quiet" role="status">正在加载文章</p>
+          <noscript><p>请开启 JavaScript 后重新加载此页。</p></noscript>
+        </section>
+
+        <section id="reader" class="reader" aria-labelledby="reader-title" hidden>
+          <header class="display-header reader-header">
+            <button type="button" id="back" class="control back">
+              <span aria-hidden="true">‹</span> 全部文章
+            </button>
+            <time id="reader-date" class="quiet"></time>
+          </header>
+
+          <article class="reading-area">
+            <h2 id="reader-title" tabindex="-1"></h2>
+            <p id="reader-text"></p>
+          </article>
+
+          <div class="audio-controls" role="group" aria-label="文章音频">
+            <button type="button" id="audio-toggle" class="control audio-toggle" hidden>
+              <span id="audio-icon" aria-hidden="true">▶</span>
+              <span id="audio-label">播放音频</span>
+            </button>
+            <span id="audio-status" class="quiet" role="status"></span>
+            <div id="media" hidden></div>
+          </div>
+
+          <nav class="pagination" aria-label="正文分页">
+            <button type="button" id="previous-page" class="control">
+              <span aria-hidden="true">‹</span> 上一页
+            </button>
+            <span id="page-indicator" class="quiet" aria-live="polite"></span>
+            <button type="button" id="next-page" class="control">
+              下一页 <span aria-hidden="true">›</span>
+            </button>
+          </nav>
+        </section>
+      </div>
+
+      <footer class="keyboard-hints" aria-label="键盘操作提示">
+        <span><kbd>↑</kbd> <kbd>↓</kbd> 选文或翻页</span>
+        <span><kbd>Enter</kbd> 确认或播放</span>
+        <span><kbd>Esc</kbd> 返回</span>
+      </footer>
+    </main>
+  </body>
+</html>
