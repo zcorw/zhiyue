@@ -39,3 +39,7 @@
 ## 当前完成度
 
 虚构演示已由用户在眼镜实机验证操作流程。知声配对与只读接入已写入两个本地工作区，隔离 PostgreSQL 的真实 HTTP 两账户测试通过。正式启用及接入版真机验证见[知声接入记录](docs/stage-07-zhisheng-integration.md)。
+
+## Renewable device authorization implementation
+
+The client now supports automatic renewal and valid legacy-binding upgrades. See [docs/device-renewal.md](docs/device-renewal.md) for the coordinated protocol and verification boundaries. Local VM tests do not establish backend deployment or Rokid hardware acceptance. Existing fixed 24-hour pairing notes describe the legacy behavior.

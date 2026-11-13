@@ -35,3 +35,7 @@
 已完成 [Stage 0 平台调研](stage-00-platform.md) 和 [Stage 1 首版范围](stage-01-scope.md)。按用户要求先交付[虚构数据演示](demo.md)，正式接入流程由 [Stage 2](stage-02-flow.md) 继续跟踪。
 
 知声账号、只读文章和音频接入见[知声接入记录](stage-07-zhisheng-integration.md)。
+
+## Renewable device authorization implementation
+
+The client now supports automatic renewal and valid legacy-binding upgrades. See [device-renewal.md](device-renewal.md) for the coordinated protocol and verification boundaries. Local VM tests do not establish backend deployment or Rokid hardware acceptance. Existing fixed 24-hour pairing notes describe the legacy behavior.

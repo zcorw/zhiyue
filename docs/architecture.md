@@ -26,3 +26,7 @@
 虚构演示的 AIUI 端和电脑预览各自处理渲染、输入和播放器生命周期，共用固定文章数据与本地音频资产。演示中的每个短段预先指定为一屏，真实文章的布局分页和内容接入在后续设计。见[演示说明](demo.md)。
 
 知声接入时，眼镜只调用单独的 HTTPS 设备接口，手机确认沿用知声网页会话。知声管理账号、设备授权和媒体票，知阅按当前 `accountId` 与 `bindingId` 隔离阅读状态。详见[知声接入记录](stage-07-zhisheng-integration.md)。
+
+## Renewable device authorization implementation
+
+The client now supports automatic renewal and valid legacy-binding upgrades. See [device-renewal.md](device-renewal.md) for the coordinated protocol and verification boundaries. Local VM tests do not establish backend deployment or Rokid hardware acceptance. Existing fixed 24-hour pairing notes describe the legacy behavior.

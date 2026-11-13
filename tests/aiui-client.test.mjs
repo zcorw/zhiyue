@@ -21,7 +21,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function createRuntime({ base = origin, request = () => assert.fail('没有预期网络请求') } = {}) {
+function createRuntime({ base = origin, upgrade = false, request = () => assert.fail('没有预期网络请求') } = {}) {
   const storage = new Map();
   const timerQueue = new Map();
   const navigation = [];
@@ -47,7 +47,7 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
     navigateBack() { navigation.push('back'); },
   };
   const context = createContext({
-    URL, AbortController, AbortSignal, fetch: request,
+    URL, AbortController, AbortSignal, fetch: (...args) => !upgrade && args[0].endsWith('/device/upgrade') ? Promise.resolve(json({}, 404)) : request(...args),
     Date: class extends Date { static now() { return clock; } },
     localStorage: {
       getItem: (key) => storage.get(key) ?? null,
@@ -417,6 +417,7 @@ test('取消播放时丢弃迟到票据，授权过期清空阅读状态', async
   await settle();
   assert.equal(runtime.players.length, 0);
   await runtime.advance(1000);
+  await settle();
   assert.equal(reader.data.hasBody, false);
   assert.match(reader.data.body, /授权已失效/);
   assert.equal(runtime.storage.size, 0);
@@ -501,6 +502,7 @@ test('恢复时重新授权后才显示列表和正文，并保留原位置', as
   library.onShow();
   library.onShow();
   assert.equal(library.data.rows.length, 0);
+  await settle();
   assert.equal(listCalls, 2);
   listRefresh.resolve(list());
   await settle();
@@ -518,6 +520,7 @@ test('恢复时重新授权后才显示列表和正文，并保留原位置', as
   reader.onShow();
   reader.onShow();
   assert.equal(reader.data.hasBody, false);
+  await settle();
   assert.equal(detailCalls, 2);
   detailRefresh.resolve(detail());
   await settle();
@@ -533,4 +536,417 @@ test('恢复时重新授权后才显示列表和正文，并保留原位置', as
   library.onShow();
   assert.equal(library.data.rows.length, 0);
   assert.equal(library.data.bound, false);
+});
+
+test('renewable binding survives long idle periods and concurrent renewal uses one request', async () => {
+  let renewals = 0;
+  let reads = 0;
+  const pending = deferred();
+  const runtime = createRuntime({ request: async (href, options) => {
+    if (href.endsWith('/device/refresh')) {
+      renewals++;
+      assert.deepEqual(JSON.parse(options.body), { refresh_token: 'stable-refresh' });
+      assert.equal(options.redirect, 'error');
+      assert.equal(options.credentials, 'omit');
+      assert.equal(options.headers.Authorization, undefined);
+      if (renewals === 1) await pending.promise;
+      return json({ ...session, access_token: `access-${renewals}`, refresh_token: 'stable-refresh' });
+    }
+    reads++;
+    assert.equal(options.headers.Authorization, `Bearer access-${renewals}`);
+    return json({ items: [], total: 0, limit: 12, offset: 0 });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding({ token: 'old-access', refreshToken: 'stable-refresh', expiresAt: 1_800_000_001_000,
+    bindingId: session.binding_id, account: session.account });
+  await runtime.advance(365 * 86400000);
+  assert.ok(zhisheng.getBinding());
+  const a = zhisheng.listArticles(0);
+  const b = zhisheng.listArticles(0);
+  await settle();
+  assert.equal(renewals, 1);
+  pending.resolve();
+  await Promise.all([a, b]);
+  assert.equal(reads, 2);
+  for (let i = 0; i < 3; i++) {
+    await runtime.advance(86400001);
+    await zhisheng.listArticles(0);
+  }
+  assert.equal(renewals, 4);
+  assert.equal(zhisheng.getBinding().refreshToken, 'stable-refresh');
+});
+
+test('legacy upgrade is automatic, persists credentials, and rejects changed identity', async () => {
+  let mismatch = false;
+  const runtime = createRuntime({ upgrade: true, request: async (href, options) => {
+    assert.ok(href.endsWith('/device/upgrade'));
+    assert.equal(options.headers.Authorization, 'Bearer legacy');
+    return json({ ...session, binding_id: mismatch ? 'wrong-binding' : session.binding_id,
+      refresh_token: 'stable-refresh' });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  const binding = { token: 'legacy', expiresAt: 1_800_000_060_000,
+    bindingId: session.binding_id, account: session.account };
+  zhisheng.saveBinding(binding);
+  mismatch = true;
+  await assert.rejects(zhisheng.ensureBinding(), { code: 'bad_response' });
+  assert.equal(zhisheng.getBinding().token, 'legacy');
+  mismatch = false;
+  await zhisheng.ensureBinding();
+  assert.equal(zhisheng.getBinding().refreshToken, 'stable-refresh');
+});
+
+test('transient renewal failure retains binding while permanent revocation clears it', async () => {
+  let failure = 'network';
+  const runtime = createRuntime({ request: async () => {
+    if (failure === 'network') throw new Error('offline');
+    return json({ error: 'invalid_grant' }, 400);
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding({ token: 'old', refreshToken: 'refresh', expiresAt: 1_800_000_001_000,
+    bindingId: session.binding_id, account: session.account });
+  await runtime.advance(86400000);
+  await assert.rejects(zhisheng.listArticles(0), { code: 'network' });
+  assert.equal(zhisheng.getBinding().refreshToken, 'refresh');
+  failure = 'revoked';
+  await assert.rejects(zhisheng.listArticles(0), { code: 'auth_required' });
+  assert.equal(zhisheng.getBinding(), null);
+});
+
+test('401 refreshes once and a revoked retry cannot loop', async () => {
+  let renewals = 0;
+  let reads = 0;
+  const runtime = createRuntime({ request: async (href) => {
+    if (href.endsWith('/device/refresh')) {
+      renewals++;
+      return json({ ...session, access_token: 'replacement', refresh_token: 'refresh' });
+    }
+    reads++;
+    return json({ error: 'invalid_token' }, 401);
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding({ token: 'old', refreshToken: 'refresh', expiresAt: 1_800_086_400_000,
+    bindingId: session.binding_id, account: session.account });
+  await assert.rejects(zhisheng.listArticles(0), { code: 'auth_required' });
+  assert.equal(renewals, 1);
+  assert.equal(reads, 2);
+  assert.equal(zhisheng.getBinding(), null);
+});
+
+test('failed credential persistence is retryable and a fresh client restores expired access', async () => {
+  const runtime = createRuntime();
+  const { createZhishengClient } = await runtime.load('lib/zhisheng.js');
+  let stored = null;
+  let failWrite = false;
+  let clock = 1_800_000_000_000;
+  let count = 0;
+  const storage = {
+    getItem: () => stored,
+    setItem: (_key, value) => { if (failWrite) throw new Error('disk'); stored = value; },
+    removeItem: () => { stored = null; },
+  };
+  const request = async (href) => {
+    assert.ok(href.endsWith('/device/refresh'));
+    count++;
+    return json({ ...session, access_token: `replacement-${count}`, refresh_token: 'refresh' });
+  };
+  const options = { origin, storage, request, now: () => clock };
+  const client = createZhishengClient(options);
+  client.saveBinding({ token: 'old', refreshToken: 'refresh', expiresAt: clock + 1000,
+    bindingId: session.binding_id, account: session.account });
+  clock += 86400000;
+  failWrite = true;
+  await assert.rejects(client.ensureBinding(), { code: 'storage' });
+  assert.equal(JSON.parse(stored).token, 'old');
+  failWrite = false;
+  const restarted = createZhishengClient(options);
+  await restarted.ensureBinding();
+  assert.equal(restarted.getBinding().token, 'replacement-2');
+  assert.equal(restarted.getBinding().refreshToken, 'refresh');
+});
+
+test('new unstored grants are revoked after failed save without deleting another stored account', async () => {
+  const revoked = [];
+  const runtime = createRuntime({ request: async (_href, options) => {
+    assert.equal(options.method, 'DELETE');
+    revoked.push(options.headers.Authorization);
+    return new Response(null, { status: 204 });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  const grant = { token: 'unstored', refreshToken: 'refresh', expiresAt: 1_800_000_060_000,
+    bindingId: 'unsaved-binding', account: session.account };
+  await zhisheng.revokeBinding(grant);
+  assert.deepEqual(revoked, ['Bearer unstored']);
+  zhisheng.saveBinding({ ...grant, token: 'existing', bindingId: 'existing-binding' });
+  assert.throws(() => zhisheng.saveBinding(grant), { code: 'binding_exists' });
+  await zhisheng.revokeBinding(grant);
+  assert.deepEqual(revoked, ['Bearer unstored', 'Bearer unstored']);
+  assert.equal(zhisheng.getBinding().token, 'existing');
+});
+
+test('leaving pairing during claim revokes the late unstored grant', async () => {
+  const claim = deferred();
+  const revoked = [];
+  const runtime = createRuntime({ request: async (href, options) => {
+    if (href.endsWith('/device/authorize')) return json({ device_code: 'code', user_code: 'ABCD-EFGH',
+      verification_uri: `${origin}/connections/zhiyue`, expires_in: 300, interval: 5 });
+    if (href.endsWith('/device/token')) return claim.promise;
+    assert.equal(options.method, 'DELETE');
+    revoked.push(options.headers.Authorization);
+    return new Response(null, { status: 204 });
+  } });
+  const pair = await runtime.page('pair');
+  await pair.startPairing();
+  const poll = runtime.advance(5000);
+  await settle();
+  pair.onUnload();
+  claim.resolve(json({ ...session, refresh_token: 'refresh' }));
+  await poll;
+  assert.deepEqual(revoked, [`Bearer ${session.access_token}`]);
+  assert.equal(runtime.storage.size, 0);
+});
+
+function pendingGrant() {
+  return { ...session, refresh_token: 'pending-refresh', confirmation_required: true };
+}
+
+test('initial confirmation waits for reliable persistence and is single-flight before any read', async () => {
+  const wait = deferred();
+  let confirms = 0;
+  let reads = 0;
+  let client;
+  const runtime = createRuntime({ request: async (href, options) => {
+    if (href.endsWith('/device/token')) return json(pendingGrant());
+    if (href.endsWith('/device/confirm')) {
+      confirms++;
+      assert.equal(client.getBinding().pendingConfirmation, true);
+      assert.deepEqual(JSON.parse(options.body), { refresh_token: 'pending-refresh' });
+      assert.equal(options.redirect, 'error');
+      assert.equal(options.credentials, 'omit');
+      await wait.promise;
+      return new Response(null, { status: 204 });
+    }
+    reads++;
+    assert.equal(client.getBinding().pendingConfirmation, undefined);
+    return json({ items: [], offset: 0, limit: 12, total: 0 });
+  } });
+  client = (await runtime.load('lib/zhisheng.js')).zhisheng;
+  const binding = await client.exchangeDeviceCode('code');
+  assert.equal(binding.pendingConfirmation, true);
+  assert.equal(confirms, 0);
+  client.saveBinding(binding);
+  const a = client.listArticles(0);
+  const b = client.listArticles(0);
+  await settle();
+  assert.equal(confirms, 1);
+  assert.equal(reads, 0);
+  wait.resolve();
+  await Promise.all([a, b]);
+  assert.equal(reads, 2);
+});
+
+test('lost confirmation response and failed marker save survive restart and retry idempotently', async () => {
+  const runtime = createRuntime();
+  const { createZhishengClient } = await runtime.load('lib/zhisheng.js');
+  let raw = null;
+  let failSave = false;
+  let confirms = 0;
+  const storage = {
+    getItem: () => raw,
+    setItem: (_key, value) => { if (failSave) throw new Error('disk'); raw = value; },
+    removeItem: () => { raw = null; },
+  };
+  const request = async (href) => {
+    if (href.endsWith('/device/token')) return json(pendingGrant());
+    assert.ok(href.endsWith('/device/confirm'));
+    confirms++;
+    if (confirms === 1) throw new Error('response lost after server commit');
+    return new Response(null, { status: 204 });
+  };
+  const options = { origin, storage, request, now: () => 1_800_000_000_000 };
+  let client = createZhishengClient(options);
+  const grant = await client.exchangeDeviceCode('code');
+  failSave = true;
+  assert.throws(() => client.saveBinding(grant), { code: 'storage' });
+  assert.equal(confirms, 0);
+  assert.equal(raw, null);
+  failSave = false;
+  client.saveBinding(grant);
+  await assert.rejects(client.ensureBinding(), { code: 'network' });
+  assert.equal(JSON.parse(raw).pendingConfirmation, true);
+  client = createZhishengClient(options);
+  failSave = true;
+  await assert.rejects(client.ensureBinding(), { code: 'storage' });
+  assert.equal(JSON.parse(raw).pendingConfirmation, true);
+  failSave = false;
+  client = createZhishengClient(options);
+  await client.ensureBinding();
+  assert.equal(confirms, 3);
+  assert.equal(client.getBinding().pendingConfirmation, undefined);
+});
+
+test('confirmation deadline or revocation permanently clears pending binding without reading', async () => {
+  let confirms = 0;
+  const runtime = createRuntime({ request: async (href) => {
+    if (href.endsWith('/device/token')) return json(pendingGrant());
+    assert.ok(href.endsWith('/device/confirm'));
+    confirms++;
+    return json({ error: 'invalid_grant' }, 400);
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(await zhisheng.exchangeDeviceCode('code'));
+  await runtime.advance(300001);
+  await assert.rejects(zhisheng.listArticles(0), { code: 'auth_required' });
+  assert.equal(confirms, 1);
+  assert.equal(zhisheng.getBinding(), null);
+});
+
+test('cancelled confirmation cannot restore the locally revoked binding', async () => {
+  const confirm = deferred();
+  let revoked = 0;
+  const runtime = createRuntime({ request: async (href, options) => {
+    if (href.endsWith('/device/token')) return json(pendingGrant());
+    if (href.endsWith('/device/confirm')) return confirm.promise;
+    assert.equal(options.method, 'DELETE');
+    revoked++;
+    return new Response(null, { status: 204 });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  const binding = await zhisheng.exchangeDeviceCode('code');
+  zhisheng.saveBinding(binding);
+  const pending = assert.rejects(zhisheng.ensureBinding(), { code: 'auth_required' });
+  await settle();
+  await zhisheng.revokeBinding(binding);
+  confirm.resolve(new Response(null, { status: 204 }));
+  await pending;
+  assert.equal(revoked, 1);
+  assert.equal(zhisheng.getBinding(), null);
+});
+
+test('expired legacy access retries an uncertain upgrade within the server recovery window', async () => {
+  let upgrades = 0;
+  const runtime = createRuntime({ upgrade: true, request: async (href) => {
+    assert.ok(href.endsWith('/device/upgrade'));
+    upgrades++;
+    if (upgrades === 1) throw new Error('lost upgrade response');
+    return json({ ...session, refresh_token: 'recovered', confirmation_required: false });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding({ token: 'legacy', expiresAt: 1_800_000_001_000,
+    bindingId: session.binding_id, account: session.account });
+  await assert.rejects(zhisheng.ensureBinding(), { code: 'network' });
+  await runtime.advance(2000);
+  assert.ok(zhisheng.getBinding());
+  await zhisheng.ensureBinding();
+  assert.equal(zhisheng.getBinding().refreshToken, 'recovered');
+});
+
+test('pairing preserves uncertain confirmation, retries, and returns only after confirmation', async () => {
+  let confirms = 0;
+  const runtime = createRuntime({ request: async (href) => {
+    if (href.endsWith('/device/authorize')) return json({ device_code: 'code', user_code: 'ABCD-EFGH',
+      verification_uri: `${origin}/connections/zhiyue`, expires_in: 300, interval: 5 });
+    if (href.endsWith('/device/token')) return json(pendingGrant());
+    assert.ok(href.endsWith('/device/confirm'));
+    confirms++;
+    if (confirms === 1) throw new Error('offline');
+    return new Response(null, { status: 204 });
+  } });
+  const pair = await runtime.page('pair');
+  await pair.startPairing();
+  await runtime.advance(5000);
+  assert.equal(runtime.navigation.length, 0);
+  assert.equal(JSON.parse([...runtime.storage.values()][0]).pendingConfirmation, true);
+  assert.equal(pair.data.action, '重试确认');
+  await runtime.advance(5000);
+  assert.equal(runtime.navigation.at(-1), 'back');
+  assert.equal(JSON.parse([...runtime.storage.values()][0]).pendingConfirmation, undefined);
+});
+
+test('leaving pairing during confirm revokes and never reports success afterward', async () => {
+  const confirm = deferred();
+  let revoked = 0;
+  const runtime = createRuntime({ request: async (href, options) => {
+    if (href.endsWith('/device/authorize')) return json({ device_code: 'code', user_code: 'ABCD-EFGH',
+      verification_uri: `${origin}/connections/zhiyue`, expires_in: 300, interval: 5 });
+    if (href.endsWith('/device/token')) return json(pendingGrant());
+    if (href.endsWith('/device/confirm')) return confirm.promise;
+    assert.equal(options.method, 'DELETE');
+    revoked++;
+    return new Response(null, { status: 204 });
+  } });
+  const pair = await runtime.page('pair');
+  await pair.startPairing();
+  const polling = runtime.advance(5000);
+  await settle();
+  pair.onUnload();
+  await settle();
+  confirm.resolve(new Response(null, { status: 204 }));
+  await polling;
+  assert.equal(revoked, 1);
+  assert.equal(runtime.storage.size, 0);
+  assert.equal(runtime.navigation.length, 0);
+});
+
+test('in-flight cancellation blocks a concurrent confirmation and reading until revocation completes', async () => {
+  const confirm = deferred();
+  const revoke = deferred();
+  const runtime = createRuntime({ request: async (href, options) => {
+    if (href.endsWith('/device/token')) return json(pendingGrant());
+    if (href.endsWith('/device/confirm')) return confirm.promise;
+    assert.equal(options.method, 'DELETE');
+    return revoke.promise;
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  const binding = await zhisheng.exchangeDeviceCode('code');
+  zhisheng.saveBinding(binding);
+  const pending = assert.rejects(zhisheng.ensureBinding(), { code: 'revoking' });
+  await settle();
+  const cancelling = zhisheng.revokeBinding(binding);
+  await assert.rejects(zhisheng.listArticles(0), { code: 'revoking' });
+  confirm.resolve(new Response(null, { status: 204 }));
+  await pending;
+  assert.equal(zhisheng.getBinding().pendingConfirmation, true);
+  revoke.resolve(new Response(null, { status: 204 }));
+  await cancelling;
+  assert.equal(zhisheng.getBinding(), null);
+});
+
+test('server rejection after the fixed legacy upgrade recovery window clears the local legacy grant', async () => {
+  let upgrades = 0;
+  const runtime = createRuntime({ upgrade: true, request: async (href) => {
+    assert.ok(href.endsWith('/device/upgrade'));
+    upgrades++;
+    if (upgrades === 1) throw new Error('lost successful upgrade response');
+    return json({ error: 'invalid_grant' }, 400);
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding({ token: 'legacy', expiresAt: 1_800_000_001_000,
+    bindingId: session.binding_id, account: session.account });
+  await assert.rejects(zhisheng.ensureBinding(), { code: 'network' });
+  await runtime.advance(300001);
+  await assert.rejects(zhisheng.ensureBinding(), { code: 'auth_required' });
+  assert.equal(zhisheng.getBinding(), null);
+});
+
+test('an already confirmed binding with a stale local pending marker recovers after access expiry', async () => {
+  const calls = [];
+  const runtime = createRuntime({ request: async (href) => {
+    if (href.endsWith('/device/token')) return json(pendingGrant());
+    if (href.endsWith('/device/confirm')) {
+      calls.push('confirm');
+      return new Response(null, { status: 204 });
+    }
+    assert.ok(href.endsWith('/device/refresh'));
+    calls.push('refresh');
+    return json({ ...session, access_token: 'new-access', refresh_token: 'pending-refresh', confirmation_required: false });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(await zhisheng.exchangeDeviceCode('code'));
+  // The first confirmation succeeded remotely but its response was lost before this restart.
+  await runtime.advance(2 * 86400000);
+  await zhisheng.ensureBinding();
+  assert.deepEqual(calls, ['confirm', 'refresh']);
+  assert.equal(zhisheng.getBinding().pendingConfirmation, undefined);
+  assert.equal(zhisheng.getBinding().token, 'new-access');
 });

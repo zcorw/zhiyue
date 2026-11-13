@@ -48,7 +48,7 @@ export default {
         this.clearLibrary('绑定知声后可查看授权文章。');
         return;
       }
-      const sameBinding = binding.token === this.binding?.token;
+      const sameBinding = binding.bindingId === this.binding?.bindingId && binding.account.id === this.binding?.account.id;
       if (sameBinding && this.request) return;
       if (sameBinding) this.rememberSelection();
       else this.resumeSelection = null;
@@ -56,7 +56,7 @@ export default {
       this.hideArticles();
       this.binding = binding;
       cancelTimer(this.expiryTimer);
-      this.expiryTimer = watchBindingExpiry(binding, () => this.expireBinding());
+      this.expiryTimer = watchBindingExpiry(binding, () => this.onShow());
       this.setData({ bound: true, canPair: true });
       this.loadLibrary(this.resumeSelection?.index ?? 0, this.resumeSelection);
     } catch {
@@ -141,6 +141,9 @@ export default {
         const position = page.items.findIndex((item) => item.id === selection.id);
         if (position >= 0) index = page.offset + position;
       }
+      this.binding = zhisheng.getBinding();
+      cancelTimer(this.expiryTimer);
+      this.expiryTimer = watchBindingExpiry(this.binding, () => this.onShow());
       this.libraryPage = page;
       this.resumeSelection = null;
       this.retrySelection = null;
@@ -149,7 +152,11 @@ export default {
     } catch (error) {
       if (this.request !== request) return;
       if (error.code === 'auth_required') this.expireBinding();
-      else this.setData({ message: '文章加载失败 · 单击重试', canRetry: true });
+      else {
+        this.setData({ message: '文章加载失败 · 单击重试', canRetry: true });
+        cancelTimer(this.expiryTimer);
+        this.expiryTimer = setTimeout(() => this.onShow(), 30000);
+      }
     } finally {
       if (this.request === request) {
         this.request = null;
