@@ -7,7 +7,7 @@
 <script setup>
 import wx from 'wx';
 import { getArticleIndex, getLibraryView } from '../../lib/reading.js';
-import { articlePageSize, cancelTimer, createRequest, watchBindingExpiry, zhisheng } from '../../lib/zhisheng.js';
+import { articlePageSize, cancelTimer, createRequest, recoveryDelay, watchBindingExpiry, zhisheng } from '../../lib/zhisheng.js';
 
 export default {
   data: {
@@ -32,6 +32,7 @@ export default {
     this.retryIndex = 0;
     this.resumeSelection = null;
     this.retrySelection = null;
+    this.recoveryAttempts = 0;
     if (zhisheng.mode === 'demo') this.setData(getLibraryView(0));
     else this.setData({ live: true });
   },
@@ -55,8 +56,7 @@ export default {
       this.cancelRequest();
       this.hideArticles();
       this.binding = binding;
-      cancelTimer(this.expiryTimer);
-      this.expiryTimer = watchBindingExpiry(binding, () => this.onShow());
+      this.watchAuthorization(binding);
       this.setData({ bound: true, canPair: true });
       this.loadLibrary(this.resumeSelection?.index ?? 0, this.resumeSelection);
     } catch {
@@ -97,6 +97,8 @@ export default {
   },
 
   cancelRequest() {
+    cancelTimer(this.recoveryTimer);
+    this.recoveryTimer = null;
     const request = this.request;
     this.request = null;
     request?.cancel();
@@ -120,8 +122,22 @@ export default {
     this.clearLibrary('授权已失效，请重新绑定。');
   },
 
+  watchAuthorization(binding) {
+    cancelTimer(this.expiryTimer);
+    this.expiryTimer = null;
+    if ((binding.refreshToken || binding.upgradePending) && binding.expiresAt <= Date.now()) return;
+    this.expiryTimer = watchBindingExpiry(binding, () => {
+      let current;
+      try { current = zhisheng.getBinding(); } catch { this.onShow(); return; }
+      if (current?.refreshToken || current?.upgradePending) this.onShow();
+      else this.expireBinding();
+    });
+  },
+
   async loadLibrary(index, selection = null) {
     if (this.request || !this.binding) return;
+    cancelTimer(this.recoveryTimer);
+    this.recoveryTimer = null;
     const request = createRequest();
     this.request = request;
     this.retryIndex = index;
@@ -141,10 +157,10 @@ export default {
         const position = page.items.findIndex((item) => item.id === selection.id);
         if (position >= 0) index = page.offset + position;
       }
-      this.binding = zhisheng.getBinding();
-      cancelTimer(this.expiryTimer);
-      this.expiryTimer = watchBindingExpiry(this.binding, () => this.onShow());
       this.libraryPage = page;
+      this.recoveryAttempts = 0;
+      this.binding = zhisheng.getBinding();
+      if (this.binding) this.watchAuthorization(this.binding);
       this.resumeSelection = null;
       this.retrySelection = null;
       this.setData({ ...getLibraryView(index, page), message: '',
@@ -154,8 +170,8 @@ export default {
       if (error.code === 'auth_required') this.expireBinding();
       else {
         this.setData({ message: '文章加载失败 · 单击重试', canRetry: true });
-        cancelTimer(this.expiryTimer);
-        this.expiryTimer = setTimeout(() => this.onShow(), 30000);
+        const delay = recoveryDelay(error, this.recoveryAttempts++);
+        if (delay !== null) this.recoveryTimer = setTimeout(() => this.retry(), delay);
       }
     } finally {
       if (this.request === request) {

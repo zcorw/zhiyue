@@ -38,8 +38,14 @@
 
 ## 当前完成度
 
+2026-11-13 已在本地将 main 的 ee5d319 整合进当前 PR #2 工作分支，解决设备客户端、三页、架构和测试的六处冲突。保留两侧回归、main 的 CI 和撤销并发保护，以及此前已测的超时恢复，并兼容双方存储字段；52 项本地回归通过。v1/v2 ZIP 是此前交付快照，当前源码以 aiui/ 为准。见[冲突处理记录](docs/merge-conflict-resolution-2026-11-13.md)。本次没有合并到 main，远端更新与审核状态另记。
+
+2026-11-13 用户最新反馈「测试通过」，并明确要求进行代码提交。本次绑定与确认等待故障的用户回归已通过；用户未补充测试环境、设备及资源包版本，因此不据此扩大为所有真机与长期授权场景已验收。以下排查与修复过程保留为历史记录。
+
+2026-11-13 最新修复：首次已补齐新版确认、可靠保存、自动续期、旧绑定升级及恢复。用户随后在 10:29 的模拟器观察到 `/device/token` 200、`/device/confirm` 长期 In Progress。第二次本地修复新增独立 10 秒请求截止时间及确认超时后的恢复探测，33 项 Node 回归通过，交付包为 `artifacts/zhiyue-aiui-binding-fix-v2.zip`。首次协议修复已进入当前模拟器，v2 尚未同步、重新打包或真机复测，当前云端包版本未核对。知声健康检查正常；服务端是否确认成功或转发链路挂起尚未证实。未改知声或部署。详见[排查与两次修复记录](docs/zhisheng-binding-diagnosis-2026-11-13.md)。
+
 虚构演示已由用户在眼镜实机验证操作流程。知声配对与只读接入已写入两个本地工作区，隔离 PostgreSQL 的真实 HTTP 两账户测试通过。正式启用及接入版真机验证见[知声接入记录](docs/stage-07-zhisheng-integration.md)。
 
-## Renewable device authorization implementation
+## 设备授权实现与整合
 
-The client now supports automatic renewal and valid legacy-binding upgrades. See [docs/device-renewal.md](docs/device-renewal.md) for the coordinated protocol and verification boundaries. Local VM tests do not establish backend deployment or Rokid hardware acceptance. Existing fixed 24-hour pairing notes describe the legacy behavior.
+客户端支持自动续期和有效旧绑定升级；已与本次确认和超时恢复修复整合，详见[设备授权协议](docs/device-renewal.md)。本地 VM 测试不代表后端部署或真机验收；固定 24 小时后重新配对的旧记录保留为历史行为。

@@ -1,43 +1,54 @@
-# Renewable device authorization
+# 设备授权续期与确认
 
-The client supports a stable, device-scoped refresh credential alongside a short-lived access credential. Neither application shutdown nor inactivity expires the logical binding. This is not an offline article or audio library.
+客户端使用短期访问凭据和稳定的设备刷新凭据。应用关闭或长期闲置不使已确认的逻辑绑定失效；文章与音频仍只保存在内存，不建立私人内容离线库。
 
-- `POST /v1/zhiyue/device/upgrade` uses the valid legacy access bearer and an empty JSON body. It must return an idempotent renewable binding without changing the logical account or device identity.
-- `POST /v1/zhiyue/device/refresh` receives `{ "refresh_token": "..." }` without browser cookies or an access bearer. Successful responses contain `access_token`, `expires_in`, `refresh_token`, `account`, and `binding_id`.
-- Renewal is single-flight in each client instance. Replacement credentials are persisted and read back before use. A stable refresh credential allows retry after a lost response or failed persistence without an additional pairing ceremony.
-- Startup and reads renew expired access credentials; HTTP 401 triggers one renewal and one retry. A second unauthorized response stops the operation. A temporary network/server error retains the binding. Permanent `invalid_grant` or `invalid_token` clears it.
-- Legacy bindings attempt upgrade while still valid. A 404 from an older backend permits continued use of the unexpired legacy binding. Never-upgraded expired legacy bindings require pairing once; a previously successful upgrade with a lost response uses the recovery path below.
-- The visible reader/library revalidates at access expiry; transient failures retry while visible. Background execution is not required. Page hiding cancels the page retry timer and clears visible private content.
-- Existing HTTPS, account/device isolation, read-only scope, revocation and memory-only content/audio caching remain. The application storage contains device credentials, not the account password or an administrator credential. Hardware-backed storage is not claimed.
+## 接口与所有权
 
-## Verification
+- POST /v1/zhiyue/device/upgrade 使用有效旧访问 Bearer 和空 JSON 对象，返回同一账号、同一逻辑设备的可续期授权，不增加设备配额。
+- POST /v1/zhiyue/device/refresh 使用 JSON 中的 refresh_token，不携带网页 Cookie 或访问 Bearer。成功响应包含 access_token、refresh_token、expires_in、account、binding_id 和 confirmation_required。
+- 单客户端内合并并发确认、升级和续期。新凭据整项保存并读回校验后才使用；刷新凭据保持稳定，使响应丢失或保存失败后可以再次续期恢复。
+- 读取前自动确认并续期；访问 401 最多触发一次续期和一次重读。第二次 401 结束本次操作，但不直接销毁仍可恢复的绑定。设备确认、升级或续期明确返回 invalid_grant、invalid_token 等永久拒绝时清理对应绑定；临时网络和服务失败保留恢复状态。
+- 所有设备 JSON 请求省略浏览器凭据并拒绝重定向，避免将刷新正文发送到另一来源。令牌不写入日志或 URL，设备授权独立于知声 MCP 授权。
+- 账号和设备身份必须保持一致，迟到结果不能覆盖另一个账号。撤销期间阻止读取、确认及续期结果写回；未保存的新授权也可按其自身凭据撤销，不删除另一账号的本地状态。
+- 媒体票可能单独过期；媒体返回 401 时复核可续期授权。明确失效时，阅读页停止播放并清除正文和音频缓存。
 
-`node --experimental-vm-modules --test tests/aiui-client.test.mjs` covers existing simulated flows and renewable authorization, multi-round renewal after extended idle time, single-flight concurrency, legacy upgrade, identity validation, temporary failure, revocation and bounded 401 recovery.
+## 首次绑定与本地状态兼容
 
-These are local Node VM tests, not a deployed backend or Rokid acceptance result. Real hardware testing across restart, phone lock and connectivity loss, plus coordinated backend deployment, remains required. Backend password changes must revoke the device binding; ordinary web logout must not.
+新领取的 confirmation_required 为 true 时，先保存访问、刷新凭据和待确认状态，再向 /device/confirm 提交刷新凭据。确认 204 后可靠保存已确认状态，才进入读取。没有新协议字段的旧响应按原有旧授权处理。
 
-## Credential tradeoffs
+同一存储键 zhiyue.binding.v1 保持兼容：统一写入 confirmationRequired；读取 main 旧版本保存的 pendingConfirmation 时先归一化。任一待确认标记为 true 都不能绕过确认门禁，成功后只保存统一字段，不要求用户因字段改名重新配对。
 
-The refresh credential is stable until revocation, not rotated on each refresh. This deliberately permits recovery after a lost response, but does not provide refresh-token reuse detection. Anyone who extracts that credential can continue read-only access until the account/device authorization is revoked; short access-token lifetime alone does not contain that compromise. Application storage is not claimed to be encrypted or hardware-backed. Protect the device and revoke lost-device bindings from the CMS. No credential is logged or placed in a URL. Device requests reject redirects and omit browser credentials so a redirected POST cannot forward its refresh body to another origin.
+确认可幂等重试。响应丢失、临时网络失败或清除本地标记失败时，保留已保存的授权并在重启或恢复后继续。服务端管理首次创建后固定五分钟的待确认期限，重试不延长；已确认绑定没有总期限或闲置超时，本地仍保留待确认标记时可再次确认后续期。
 
-## Initial grant confirmation
+离开页面前尚未保存、稍后才领取到的授权会被撤销。已经可靠保存的授权在隐藏或关闭页面后保留恢复能力，确认结果不得导航已关闭页面。用户主动解绑或网页撤销仍终止该设备授权，迟到的确认不能恢复已撤销状态。
 
-New claims can return `confirmation_required: true`. The client saves the complete grant with `pendingConfirmation: true` and verifies persistence before sending `POST /v1/zhiyue/device/confirm` with the refresh credential. A 204 response is followed by a second durable write clearing the pending marker. Reading and successful pairing are blocked until both steps finish. Older backends without the field are treated as already confirmed.
+## 独立截止时间与不确定结果恢复
 
-Confirmation is idempotent. Lost responses, temporary network errors, or failure to clear the local marker retain the saved grant; restart and the next `ensureBinding` retry confirmation before reading or refreshing. A permanent `invalid_grant` clears it. The server owns the fixed five-minute unconfirmed-grant deadline; retries must not extend it. Confirmed bindings have no total lifetime or idle timeout. Client-side claim retries retain the original pairing-code deadline because the client cannot infer a later server grant-creation time after a lost response.
+设备 JSON 请求有独立十秒截止时间，覆盖 fetch 与响应体读取，不依赖宿主的 timeout 参数。到期先让调用者退出等待，再尝试取消底层请求；完全没有取消 API 时仍可退出。页面取消只中断自己的读取，不中断共享凭据恢复。
 
-Pairing cancellation explicitly revokes a newly received or locally pending grant. Cancellation racing with confirmation cannot restore removed local state or navigate as a successful pairing. A temporary confirmation failure is not cancellation and does not revoke the grant. No real credentials are used by the tests.
+仅确认超时才尝试续期探测；服务端只允许已确认绑定续期，因此成功且账号、绑定及刷新凭据一致的结果可证明确认已完成。探测也有独立十秒截止时间。探测拒绝可能是尚未确认，不据此删除待确认授权；保留原超时错误，释放共享任务并退避重试。迟到响应不进入已退出调用的保存或导航步骤。
 
-Legacy upgrade recovery is separate: an expired local legacy access credential is retained for one upgrade attempt rather than discarded, since the backend may already have successfully upgraded it before losing the response. The server accepts its recorded upgrade-recovery credential only within a fixed five-minute window after the first successful upgrade; retries do not extend that window. The first successful refresh destroys the old-bearer recovery material. Never-upgraded expired bindings and recovery attempts outside that window are rejected with `invalid_grant`. The server derives the upgrade refresh credential with a private random nonce and HMAC; it is not a publicly computable hash of the old access token. This recovery deadline does not expire the already confirmed device binding. Network failures retain the recoverable local state, while permanent rejection or an unavailable old-backend upgrade endpoint after expiry clears it. Legacy upgrades return confirmed bindings and do not require the five-minute initial-confirmation flow.
+## 旧授权升级与恢复窗口
 
+有效旧绑定自动升级。请求前先保存 upgradePending 标记，若服务端已成功而响应丢失，即使跨过旧访问期限，也能在服务端固定五分钟窗口内用原凭据恢复；重试不延长窗口，首次成功刷新会清理恢复材料。尚未开始升级就已过期的旧授权需重新配对。
 
-## Backend/client compatibility
+旧后端缺少升级路由时，未到期旧授权仍可读取；到期后重新配对。服务端使用私有随机 nonce 与 HMAC 生成升级恢复凭据，不是旧访问令牌的公开可计算哈希。恢复窗口到期不使已确认的逻辑设备绑定失效。
 
-| Client | Backend | Behavior |
+## 页面与凭据边界
+
+可见列表和阅读页在访问到期时重新校验，临时失败按一、二、四秒退避，最多三十秒，并尊重 Retry-After。隐藏页面取消页面重试并清空可见私人内容；无需应用关闭或眼镜关机期间持续后台续期。凭据正常轮换保持同一逻辑绑定内的选文和阅读位置。
+
+刷新凭据在撤销前稳定，不提供每次刷新轮换或复用检测。应用存储不宣称加密或硬件保护；初版不要求硬件级安全存储。设备凭据泄漏后的访问由设备或账号撤销终止；短期访问令牌有效期不能替代撤销。客户端不保存账号密码或长期管理员凭据。
+
+## 版本兼容与验证
+
+| 客户端 | 后端 | 行为 |
 | --- | --- | --- |
-| New | Old | Missing `confirmation_required` means no confirmation step. An unavailable upgrade endpoint permits the still-valid legacy grant; after expiry the user pairs again. |
-| New | New | Persist, confirm, then read. Existing valid legacy bindings upgrade with the bounded recovery window described above. |
-| Old | New | New pairing cannot complete confirmation; reading remains blocked and the unconfirmed grant is destroyed after five minutes. Upgrade the client. The backend must not implicitly confirm or weaken the gate for old clients. |
-| Old | Old | Original fixed-lifetime legacy behavior. |
+| 新 | 旧 | 没有确认字段时按旧协议；升级路由缺失时允许未过期旧授权继续读取 |
+| 新 | 新 | 先保存、确认再读取；有效旧绑定按固定恢复窗口升级 |
+| 旧 | 新 | 无法完成新绑定确认，未确认授权在五分钟后失效；应升级客户端 |
+| 旧 | 旧 | 原有固定有效期流程 |
 
-A confirmed binding whose client still has a pending marker may retry confirmation after 24 hours or longer: the server returns 204, the client persists the cleared marker, then refreshes expired access. The five-minute deadline applies to never-confirmed new grants, not to confirmed bindings or this local recovery marker.
+合并双方回归并增加旧字段兼容及媒体撤销用例后，node --experimental-vm-modules --test tests/aiui-client.test.mjs 共 52 项通过。GitHub 的 device-check 工作流继续执行同一回归和 git diff --check。
+
+这些测试是本地 Node VM 验证。用户此前反馈绑定与等待故障测试通过，未补充设备和资源包版本；本次冲突整合后的真机、手机锁屏、长期停用、密码修改撤销及普通网页退出保留仍须分别验收。v1/v2 ZIP 为此前交付快照，整合后的最新源码以 aiui/ 目录为准。

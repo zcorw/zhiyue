@@ -8,7 +8,7 @@
 import wx from 'wx';
 import { getArticle, paginate } from '../../lib/reading.js';
 import { createAudioController } from '../../lib/audio.js';
-import { cancelTimer, createRequest, watchBindingExpiry, zhisheng } from '../../lib/zhisheng.js';
+import { cancelTimer, createRequest, recoveryDelay, watchBindingExpiry, zhisheng } from '../../lib/zhisheng.js';
 
 const playbackLabel = {
   idle: '播放音频',
@@ -39,9 +39,10 @@ export default {
     this.request = null;
     this.player = null;
     this.pages = [];
-    this.bindingToken = null;
+    this.bindingId = null;
     this.releaseId = null;
     this.resumePosition = null;
+    this.recoveryAttempts = 0;
     if (zhisheng.mode === 'demo') this.showArticle(getArticle(this.articleId));
   },
 
@@ -61,14 +62,13 @@ export default {
         this.expireBinding();
         return;
       }
-      const sameBinding = this.bindingToken === `${binding.account.id}:${binding.bindingId}`;
+      const sameBinding = this.bindingId === binding.bindingId;
       if (sameBinding && this.request) return;
       if (sameBinding) this.rememberPosition();
       else this.resumePosition = null;
       this.cancelLoad();
-      this.bindingToken = `${binding.account.id}:${binding.bindingId}`;
-      cancelTimer(this.expiryTimer);
-      this.expiryTimer = watchBindingExpiry(binding, () => this.onShow());
+      this.bindingId = binding.bindingId;
+      this.watchAuthorization(binding);
       this.loadArticle();
     } catch {
       this.showMessage('无法读取眼镜上的账号信息。');
@@ -77,14 +77,17 @@ export default {
 
   async loadArticle() {
     if (this.request || !this.articleId) return;
+    cancelTimer(this.recoveryTimer);
+    this.recoveryTimer = null;
     const request = createRequest();
     this.request = request;
     this.showMessage('正在加载文章…');
     try {
       const article = await zhisheng.getArticle(this.articleId, request.signal);
       if (this.request === request) {
-        cancelTimer(this.expiryTimer);
-        this.expiryTimer = watchBindingExpiry(zhisheng.getBinding(), () => this.onShow());
+        this.recoveryAttempts = 0;
+        const binding = zhisheng.getBinding();
+        if (binding) this.watchAuthorization(binding);
         this.showArticle(article);
       }
     } catch (error) {
@@ -93,12 +96,24 @@ export default {
       else if (error.code === 'not_found' || error.code === 'forbidden') this.showMessage('这篇文章已不可用。');
       else {
         this.showMessage('文章加载失败。', true);
-        cancelTimer(this.expiryTimer);
-        this.expiryTimer = setTimeout(() => this.onShow(), 30000);
+        const delay = recoveryDelay(error, this.recoveryAttempts++);
+        if (delay !== null) this.recoveryTimer = setTimeout(() => this.loadArticle(), delay);
       }
     } finally {
       if (this.request === request) this.request = null;
     }
+  },
+
+  watchAuthorization(binding) {
+    cancelTimer(this.expiryTimer);
+    this.expiryTimer = null;
+    if ((binding.refreshToken || binding.upgradePending) && binding.expiresAt <= Date.now()) return;
+    this.expiryTimer = watchBindingExpiry(binding, () => {
+      let current;
+      try { current = zhisheng.getBinding(); } catch { this.onShow(); return; }
+      if (current?.refreshToken || current?.upgradePending) this.onShow();
+      else this.expireBinding();
+    });
   },
 
   showArticle(article) {
@@ -155,11 +170,13 @@ export default {
     this.onHide();
     this.player = null;
     this.pages = [];
-    this.bindingToken = null;
+    this.bindingId = null;
     this.resumePosition = null;
   },
 
   cancelLoad() {
+    cancelTimer(this.recoveryTimer);
+    this.recoveryTimer = null;
     const request = this.request;
     this.request = null;
     request?.cancel();
@@ -170,7 +187,7 @@ export default {
     this.cancelLoad();
     cancelTimer(this.expiryTimer);
     this.expiryTimer = null;
-    this.bindingToken = null;
+    this.bindingId = null;
     this.resumePosition = null;
     this.showMessage('授权已失效，请返回列表重新绑定。');
   },
