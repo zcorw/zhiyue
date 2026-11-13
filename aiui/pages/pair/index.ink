@@ -6,7 +6,7 @@
 
 <script setup>
 import wx from 'wx';
-import { cancelTimer, createRequest, zhisheng } from '../../lib/zhisheng.js';
+import { cancelTimer, createRequest, recoveryDelay, zhisheng } from '../../lib/zhisheng.js';
 
 export default {
   data: {
@@ -24,6 +24,7 @@ export default {
     this.operation = null;
     this.attempt = null;
     this.binding = null;
+    this.recoveryAttempts = 0;
   },
 
   onShow() {
@@ -40,7 +41,8 @@ export default {
     if (this.operation) return;
     try {
       const binding = zhisheng.getBinding();
-      if (binding) this.showBound(binding);
+      if (binding?.confirmationRequired) this.resumeBinding();
+      else if (binding) this.showBound(binding);
       else if (this.binding) {
         this.binding = null;
         this.showRetry('授权已失效，请重新绑定。');
@@ -71,7 +73,8 @@ export default {
 
   primaryAction() {
     if (this.closed || this.operation || this.attempt) return;
-    if (this.binding) this.changeAccount();
+    if (this.data.action === '继续绑定' || this.binding?.confirmationRequired) this.resumeBinding();
+    else if (this.binding) this.changeAccount();
     else this.startPairing();
   },
 
@@ -79,8 +82,47 @@ export default {
     this.binding = binding;
     this.setData({
       heading: '知声账号', account: binding.account.displayName || '当前账号',
-      userCode: '', verificationUri: '', message: '更换账号会先撤销这副眼镜的访问权限。', action: '更换账号',
+      userCode: '', verificationUri: '',
+      message: binding.confirmationRequired ? '账号已保存，连接暂未完成。' : '更换账号会先撤销这副眼镜的访问权限。',
+      action: binding.confirmationRequired ? '继续绑定' : '更换账号',
     });
+  },
+
+  async resumeBinding() {
+    if (this.closed || this.operation) return;
+    // 确认由共享内容客户端完成；隐藏或关闭页面不会中断已保存绑定的恢复。
+    const operation = {};
+    this.clearPollTimer();
+    this.operation = operation;
+    this.setData({ userCode: '', verificationUri: '', message: '正在确认连接…', action: '' });
+    try {
+      const binding = await zhisheng.ensureBinding();
+      if (this.operation !== operation) return;
+      this.operation = null;
+      this.binding = binding;
+      this.recoveryAttempts = 0;
+      if (this.visible) this.returnToList();
+      else this.pairedWhileHidden = true;
+    } catch (error) {
+      if (this.operation !== operation) return;
+      this.operation = null;
+      if (error.code === 'auth_required') {
+        this.binding = null;
+        this.showRetry('绑定确认已失效，请重新绑定。');
+      } else {
+        try {
+          const binding = zhisheng.getBinding();
+          if (binding) {
+            this.showBound(binding);
+            const delay = recoveryDelay(error, this.recoveryAttempts++);
+            if (this.visible && delay !== null) this.pollTimer = setTimeout(() => this.resumeBinding(), delay);
+          }
+          else this.showRetry('连接暂未完成，请重试。');
+        } catch {
+          this.setData({ message: '无法保存账号信息，请重试。', action: '继续绑定' });
+        }
+      }
+    }
   },
 
   showRetry(message) {
@@ -172,8 +214,7 @@ export default {
       return;
     }
     this.binding = binding;
-    if (this.visible) this.returnToList();
-    else this.pairedWhileHidden = true;
+    await this.resumeBinding();
   },
 
   handlePollError(attempt, error) {
@@ -197,7 +238,7 @@ export default {
     this.clearPollTimer();
     const request = this.operation;
     this.operation = null;
-    request?.cancel();
+    request?.cancel?.();
     this.attempt = null;
   },
 
