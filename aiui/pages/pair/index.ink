@@ -24,6 +24,7 @@ export default {
     this.operation = null;
     this.attempt = null;
     this.binding = null;
+    this.pendingBinding = null;
   },
 
   onShow() {
@@ -40,7 +41,8 @@ export default {
     if (this.operation) return;
     try {
       const binding = zhisheng.getBinding();
-      if (binding) this.showBound(binding);
+      if (binding?.pendingConfirmation) this.resumeConfirmation(binding);
+      else if (binding) this.showBound(binding);
       else if (this.binding) {
         this.binding = null;
         this.showRetry('授权已失效，请重新绑定。');
@@ -71,7 +73,8 @@ export default {
 
   primaryAction() {
     if (this.closed || this.operation || this.attempt) return;
-    if (this.binding) this.changeAccount();
+    if (this.pendingBinding) this.resumeConfirmation(this.pendingBinding);
+    else if (this.binding) this.changeAccount();
     else this.startPairing();
   },
 
@@ -171,9 +174,44 @@ export default {
       if (!this.closed) this.showRetry('无法保存账号，请重试或到知声网页检查绑定。');
       return;
     }
+    if (binding.pendingConfirmation) {
+      await this.resumeConfirmation(binding);
+      return;
+    }
     this.binding = binding;
     if (this.visible) this.returnToList();
     else this.pairedWhileHidden = true;
+  },
+
+  async resumeConfirmation(binding) {
+    if (this.closed || this.operation) return;
+    this.clearPollTimer();
+    const operation = {};
+    this.operation = operation;
+    this.pendingBinding = binding;
+    this.setData({ heading: '绑定知声', account: '', userCode: '', verificationUri: '',
+      message: '正在确认设备绑定…', action: '' });
+    try {
+      const confirmed = await zhisheng.ensureBinding();
+      if (this.operation !== operation || this.closed) return;
+      this.operation = null;
+      this.pendingBinding = null;
+      this.binding = confirmed;
+      if (this.visible) this.returnToList();
+      else this.pairedWhileHidden = true;
+    } catch (error) {
+      if (this.operation !== operation || this.closed) return;
+      this.operation = null;
+      if (error.code === 'auth_required') {
+        this.pendingBinding = null;
+        this.binding = null;
+        this.showRetry('设备确认已失效，请重新绑定。');
+      } else {
+        // Keep the persisted grant after an uncertain confirmation result. Confirmation is idempotent.
+        this.setData({ message: '设备确认暂未完成，将自动重试。返回会取消此次绑定。', action: '重试确认' });
+        if (this.visible) this.pollTimer = setTimeout(() => this.resumeConfirmation(binding), 5000);
+      }
+    }
   },
 
   handlePollError(attempt, error) {
@@ -197,8 +235,11 @@ export default {
     this.clearPollTimer();
     const request = this.operation;
     this.operation = null;
-    request?.cancel();
+    request?.cancel?.();
     this.attempt = null;
+    const pending = this.pendingBinding;
+    this.pendingBinding = null;
+    if (pending) zhisheng.revokeBinding(pending).catch(() => {});
   },
 
   returnToList() {

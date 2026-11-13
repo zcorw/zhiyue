@@ -61,14 +61,14 @@ export default {
         this.expireBinding();
         return;
       }
-      const sameBinding = this.bindingToken === binding.token;
+      const sameBinding = this.bindingToken === `${binding.account.id}:${binding.bindingId}`;
       if (sameBinding && this.request) return;
       if (sameBinding) this.rememberPosition();
       else this.resumePosition = null;
       this.cancelLoad();
-      this.bindingToken = binding.token;
+      this.bindingToken = `${binding.account.id}:${binding.bindingId}`;
       cancelTimer(this.expiryTimer);
-      this.expiryTimer = watchBindingExpiry(binding, () => this.expireBinding());
+      this.expiryTimer = watchBindingExpiry(binding, () => this.onShow());
       this.loadArticle();
     } catch {
       this.showMessage('无法读取眼镜上的账号信息。');
@@ -82,12 +82,20 @@ export default {
     this.showMessage('正在加载文章…');
     try {
       const article = await zhisheng.getArticle(this.articleId, request.signal);
-      if (this.request === request) this.showArticle(article);
+      if (this.request === request) {
+        cancelTimer(this.expiryTimer);
+        this.expiryTimer = watchBindingExpiry(zhisheng.getBinding(), () => this.onShow());
+        this.showArticle(article);
+      }
     } catch (error) {
       if (this.request !== request) return;
       if (error.code === 'auth_required') this.expireBinding();
       else if (error.code === 'not_found' || error.code === 'forbidden') this.showMessage('这篇文章已不可用。');
-      else this.showMessage('文章加载失败。', true);
+      else {
+        this.showMessage('文章加载失败。', true);
+        cancelTimer(this.expiryTimer);
+        this.expiryTimer = setTimeout(() => this.onShow(), 30000);
+      }
     } finally {
       if (this.request === request) this.request = null;
     }

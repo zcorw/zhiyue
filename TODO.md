@@ -20,3 +20,7 @@
 - [ ] S9：生成最终项目约定和工程启动包，再进入应用实现。
 
 当前先交付[虚构数据演示](docs/demo.md)，正式接入流程由 [Stage 2](docs/stage-02-flow.md) 继续跟踪。
+
+## Renewable device authorization implementation
+
+The client now supports automatic renewal and valid legacy-binding upgrades. See [docs/device-renewal.md](docs/device-renewal.md) for the coordinated protocol and verification boundaries. Local VM tests do not establish backend deployment or Rokid hardware acceptance. Existing fixed 24-hour pairing notes describe the legacy behavior.

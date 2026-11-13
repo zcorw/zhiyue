@@ -17,3 +17,7 @@
 - 初始验证使用虚构内容；实际内容授权、敏感数据缓存、设备权限和付费服务另行按明确任务处理。
 
 后续阶段产生的具体约定应同步本文件；最终启动包前按确认结果整理，去除尚未决策的实现假设。
+
+## Renewable device authorization implementation
+
+The client now supports automatic renewal and valid legacy-binding upgrades. See [device-renewal.md](device-renewal.md) for the coordinated protocol and verification boundaries. Local VM tests do not establish backend deployment or Rokid hardware acceptance. Existing fixed 24-hour pairing notes describe the legacy behavior.

@@ -1,7 +1,7 @@
 import { zhishengEnabled, zhishengOrigin } from '../data/zhisheng-config.js';
 
 export const articlePageSize = 12;
-const pairErrors = new Set(['authorization_pending', 'slow_down', 'expired_token', 'access_denied', 'invalid_grant']);
+const pairErrors = new Set(['invalid_token', 'authorization_pending', 'slow_down', 'expired_token', 'access_denied', 'invalid_grant']);
 const maxSessionSeconds = 24 * 60 * 60;
 const maxAudioBytes = 8 * 1024 * 1024;
 const maxCachedAudioBytes = 4 * 1024 * 1024;
@@ -56,7 +56,14 @@ function validToken(value) {
 function validBinding(binding) {
   return validToken(binding?.token) && isPositiveInt(binding.expiresAt)
     && isString(binding.bindingId) && isString(binding.account?.id)
-    && typeof binding.account.displayName === 'string';
+    && typeof binding.account.displayName === 'string'
+    && (binding.refreshToken === undefined || validToken(binding.refreshToken))
+    && (binding.pendingConfirmation === undefined || typeof binding.pendingConfirmation === 'boolean')
+    && (!binding.pendingConfirmation || validToken(binding.refreshToken));
+}
+
+function sameIdentity(a, b) {
+  return Boolean(a && b && a.bindingId === b.bindingId && a.account.id === b.account.id);
 }
 
 function validListItem(item) {
@@ -79,6 +86,10 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
   const audioCache = new Map();
   let cachedBindingToken = null;
   let cacheExpiry = null;
+  let renewal = null;
+  let confirmation = null;
+  const revoking = new Set();
+  let upgradeUnavailableToken = null;
 
   function clearAudioCache() {
     audioCache.clear();
@@ -122,7 +133,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
       let binding;
       try { binding = JSON.parse(raw); } catch { binding = null; }
       const remaining = binding?.expiresAt - now();
-      if (validBinding(binding) && remaining > 0 && remaining <= maxSessionSeconds * 1000) {
+      if (validBinding(binding) && remaining <= maxSessionSeconds * 1000) {
         if (cachedBindingToken !== null && cachedBindingToken !== binding.token) clearAudioCache();
         return binding;
       }
@@ -146,21 +157,26 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
     }
   }
 
-  function saveBinding(binding) {
+  function saveBinding(binding, expected = null) {
     const remaining = binding?.expiresAt - now();
-    if (!validBinding(binding) || remaining <= 0 || remaining > maxSessionSeconds * 1000) {
+    const metadataOnly = expected && binding.refreshToken && binding.token === expected.token
+      && binding.expiresAt === expected.expiresAt && sameIdentity(binding, expected);
+    if (!validBinding(binding) || (!metadataOnly && remaining <= 0) || remaining > maxSessionSeconds * 1000) {
       throw new ZhishengError('bad_response');
     }
-    if (readBinding()) throw new ZhishengError('binding_exists');
+    const current = readBinding();
+    if (expected ? current?.token !== expected.token : current) throw new ZhishengError(expected ? 'auth_required' : 'binding_exists');
     try {
-      const { token, expiresAt, bindingId, account: { id, displayName } } = binding;
-      store().setItem(storageKey, JSON.stringify({ token, expiresAt, bindingId, account: { id, displayName } }));
+      const { token, refreshToken, pendingConfirmation, expiresAt, bindingId, account: { id, displayName } } = binding;
+      const serialized = JSON.stringify({ token, ...(refreshToken ? { refreshToken } : {}), ...(pendingConfirmation ? { pendingConfirmation: true } : {}), expiresAt, bindingId, account: { id, displayName } });
+      store().setItem(storageKey, serialized);
+      if (store().getItem(storageKey) !== serialized) throw new ZhishengError('storage');
     } catch {
       throw new ZhishengError('storage');
     }
   }
 
-  async function call(path, { method = 'GET', body, binding, signal, revoke = false } = {}) {
+  async function call(path, { method = 'GET', body, binding, signal, revoke = false, renewing = false, empty = false } = {}) {
     if (mode !== 'live') throw new ZhishengError('configuration');
     const headers = { Accept: 'application/json' };
     if (binding) headers.Authorization = `Bearer ${binding.token}`;
@@ -170,6 +186,8 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
       response = await request(`${base}/v1/zhiyue${path}`, {
         method,
         headers,
+        credentials: 'omit',
+        redirect: 'error',
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         ...(signal === undefined ? {} : { signal }),
         timeout: 10000,
@@ -182,8 +200,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
       if (response.status === 204 || response.status === 401) return null;
       throw new ZhishengError('service');
     }
-    if (response.status === 401 && binding) {
-      removeBinding(binding);
+    if (response.status === 401 && binding && !renewing) {
       throw new ZhishengError('auth_required');
     }
     if (!response.ok) {
@@ -198,20 +215,132 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         : response.status === 404 ? 'not_found' : 'service';
       throw new ZhishengError(code, Number.isFinite(delay) ? Math.max(0, delay) : 0);
     }
+    if (empty) {
+      if (response.status !== 204) throw new ZhishengError('bad_response');
+      return null;
+    }
     try { return await response.json(); } catch { throw new ZhishengError('bad_response'); }
   }
 
-  async function read(path, options) {
-    const binding = readBinding();
+  function parseBinding(token, expected) {
+    if (!isPositiveInt(token?.expires_in) || token.expires_in > maxSessionSeconds
+        || (token.confirmation_required !== undefined && typeof token.confirmation_required !== 'boolean')) throw new ZhishengError('bad_response');
+    const binding = {
+      token: token.access_token, refreshToken: token.refresh_token,
+      ...(token.confirmation_required ? { pendingConfirmation: true } : {}),
+      expiresAt: now() + token.expires_in * 1000,
+      bindingId: token.binding_id,
+      account: { id: token.account?.id, displayName: token.account?.displayName },
+    };
+    if (!validBinding(binding) || (expected && (binding.pendingConfirmation || binding.bindingId !== expected.bindingId
+        || binding.account.id !== expected.account.id || !validToken(binding.refreshToken)))) {
+      throw new ZhishengError('bad_response');
+    }
+    return binding;
+  }
+
+  async function confirmBinding(binding) {
+    const current = readBinding();
+    if (!current || current.token !== binding.token || !sameIdentity(current, binding)) throw new ZhishengError('auth_required');
+    if (!current.pendingConfirmation) return current;
+    if (confirmation?.token === binding.token) return confirmation.promise;
+    const operation = { token: binding.token };
+    operation.promise = (async () => {
+      try {
+        await call('/device/confirm', {
+          method: 'POST', body: { refresh_token: binding.refreshToken }, empty: true,
+        });
+        if (revoking.has(binding.bindingId)) throw new ZhishengError('revoking');
+        const next = { ...binding, pendingConfirmation: false };
+        saveBinding(next, binding);
+        return next;
+      } catch (error) {
+        if (error.code === 'invalid_grant' || error.code === 'invalid_token' || error.code === 'auth_required') {
+          removeBinding(binding);
+          throw new ZhishengError('auth_required');
+        }
+        throw error;
+      } finally {
+        if (confirmation === operation) confirmation = null;
+      }
+    })();
+    confirmation = operation;
+    return operation.promise;
+  }
+
+  async function ensureBinding(force = false) {
+    let binding = readBinding();
     if (!binding) throw new ZhishengError('auth_required');
-    const result = await call(path, { ...options, binding });
-    if (readBinding()?.token !== binding.token) throw new ZhishengError('auth_required');
+    if (revoking.has(binding.bindingId)) throw new ZhishengError('revoking');
+    if (binding.pendingConfirmation) binding = await confirmBinding(binding);
+    const refresh = Boolean(binding.refreshToken);
+    if (force && !refresh && upgradeUnavailableToken === binding.token) {
+      removeBinding(binding);
+      throw new ZhishengError('auth_required');
+    }
+    if (!force && binding.expiresAt > now() + 30000
+        && (refresh || upgradeUnavailableToken === binding.token)) return binding;
+    if (renewal?.token === binding.token) return renewal.promise;
+    const operation = { token: binding.token };
+    operation.promise = (async () => {
+      try {
+        const token = await call(refresh ? '/device/refresh' : '/device/upgrade', {
+          method: 'POST', body: refresh ? { refresh_token: binding.refreshToken } : {},
+          ...(refresh ? {} : { binding }), renewing: true,
+        });
+        const next = parseBinding(token, binding);
+        // Persist before using the replacement. Stable refresh credentials make a failed write retryable.
+        saveBinding(next, binding);
+        clearAudioCache();
+        return next;
+      } catch (error) {
+        if (!refresh && error.code === 'not_found' && binding.expiresAt <= now()) {
+          removeBinding(binding);
+          throw new ZhishengError('auth_required');
+        }
+        if (!refresh && !force && error.code === 'not_found' && binding.expiresAt > now()) {
+          upgradeUnavailableToken = binding.token;
+          return binding;
+        }
+        if (error.code === 'invalid_token' || error.code === 'invalid_grant' || error.code === 'auth_required') {
+          removeBinding(binding);
+          throw new ZhishengError('auth_required');
+        }
+        throw error;
+      } finally {
+        if (renewal === operation) renewal = null;
+      }
+    })();
+    renewal = operation;
+    return operation.promise;
+  }
+
+  async function read(path, options) {
+    let binding = await ensureBinding();
+    let result;
+    try {
+      result = await call(path, { ...options, binding });
+    } catch (error) {
+      if (error.code !== 'auth_required') throw error;
+      const current = readBinding();
+      if (!current || current.bindingId !== binding.bindingId || current.account.id !== binding.account.id) throw error;
+      binding = current.token !== binding.token ? current : await ensureBinding(true);
+      try { result = await call(path, { ...options, binding }); }
+      catch (retryError) {
+        if (retryError.code === 'auth_required') removeBinding(binding);
+        throw retryError;
+      }
+    }
+    const current = readBinding();
+    if (revoking.has(binding.bindingId)) throw new ZhishengError('revoking');
+    if (!current || current.bindingId !== binding.bindingId || current.account.id !== binding.account.id) throw new ZhishengError('auth_required');
     return result;
   }
 
   return {
     mode,
     getBinding: readBinding,
+    ensureBinding,
     saveBinding,
     async beginPairing(signal) {
       const grant = await call('/device/authorize', { method: 'POST', body: {}, signal });
@@ -232,22 +361,24 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
     },
     async exchangeDeviceCode(deviceCode) {
       const token = await call('/device/token', { method: 'POST', body: { device_code: deviceCode } });
-      if (!isPositiveInt(token?.expires_in) || token.expires_in > maxSessionSeconds) {
-        throw new ZhishengError('bad_response');
-      }
-      const binding = {
-        token: token.access_token,
-        expiresAt: now() + token.expires_in * 1000,
-        bindingId: token.binding_id,
-        account: { id: token.account?.id, displayName: token.account?.displayName },
-      };
-      if (!validBinding(binding)) throw new ZhishengError('bad_response');
-      return binding;
+      return parseBinding(token);
     },
     async revokeBinding(binding, signal) {
-      await call('/device/binding', { method: 'DELETE', binding, signal, revoke: true });
-      removeBinding(binding);
+      if (!validBinding(binding)) throw new ZhishengError('bad_response');
+      let current;
+      try { current = readBinding(); } catch { current = null; }
+      const stored = current?.bindingId === binding.bindingId && current?.account.id === binding.account.id;
+      // Pairing cancellation/save failure must revoke the newly issued grant even when it was never stored.
+      const active = stored && (!current.pendingConfirmation || current.expiresAt <= now()) ? await ensureBinding() : binding;
+      revoking.add(active.bindingId);
+      try {
+        await call('/device/binding', { method: 'DELETE', binding: active, signal, revoke: true });
+        if (stored) removeBinding(active);
+      } finally {
+        revoking.delete(active.bindingId);
+      }
     },
+
     async listArticles(offset, signal) {
       const page = await read(`/read/articles?limit=${articlePageSize}&offset=${offset}`, { signal });
       if (!Array.isArray(page?.items) || !page.items.every(validListItem)
@@ -269,8 +400,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
       audioCache.delete(releaseId);
     },
     async getAudioBuffer(releaseId, signal, isCancelled = () => false) {
-      const binding = readBinding();
-      if (!binding) throw new ZhishengError('auth_required');
+      let binding = await ensureBinding();
       let ticket;
       try {
         // 命中也取票，确认当前绑定、发布版本和音频仍可访问。
@@ -281,6 +411,9 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         }
         throw error;
       }
+      const active = readBinding();
+      if (!active || active.bindingId !== binding.bindingId || active.account.id !== binding.account.id) throw new ZhishengError('auth_required');
+      binding = active;
       const url = httpsUrl(ticket?.url);
       if (url.origin !== base || !url.pathname.startsWith('/v1/zhiyue/media/')
           || url.search || !isPositiveInt(ticket.expires_in)) {
@@ -288,7 +421,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
       }
 
       if (signal?.aborted || isCancelled()) throw new ZhishengError('audio_download');
-      if (readBinding()?.token !== binding.token) throw new ZhishengError('auth_required');
+      if (!sameIdentity(readBinding(), binding)) throw new ZhishengError('auth_required');
       const cached = audioCache.get(releaseId);
       if (cached) {
         audioCache.delete(releaseId);
@@ -313,6 +446,8 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         });
         if (response.url && httpsUrl(response.url).origin !== base) throw new ZhishengError('audio_download');
         if (response.status >= 400) {
+          // A media ticket may expire independently; check a renewable binding before declaring it revoked.
+          if (response.status === 401 && binding.refreshToken) await ensureBinding(true);
           const error = new ZhishengError('audio_http');
           error.status = response.status;
           throw error;
@@ -331,7 +466,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         if (error instanceof ZhishengError) throw error;
         throw new ZhishengError('audio_download');
       }
-      if (readBinding()?.token !== binding.token) throw new ZhishengError('auth_required');
+      if (!sameIdentity(readBinding(), binding)) throw new ZhishengError('auth_required');
       if (signal?.aborted || isCancelled()) throw new ZhishengError('audio_download');
       rememberAudio(binding, releaseId, bytes);
       return bytes;
@@ -347,5 +482,5 @@ export function cancelTimer(timer) {
 }
 
 export function watchBindingExpiry(binding, expire, now = Date.now) {
-  return setTimeout(expire, Math.max(0, binding.expiresAt - now()));
+  return setTimeout(expire, Math.max(binding.refreshToken ? 1000 : 0, binding.expiresAt - now()));
 }
