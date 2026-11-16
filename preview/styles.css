@@ -276,3 +276,6 @@ kbd {
     justify-content: flex-start;
   }
 }
+
+.status-filter { display: flex; align-items: center; gap: 0.6rem; margin-block: 0.7rem; }
+.status-filter select { color-scheme: dark; }

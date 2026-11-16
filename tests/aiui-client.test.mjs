@@ -831,7 +831,7 @@ test('演示模式保留文章、分页及本地音频', async () => {
   for (const route of appConfig.pages) await runtime.load(`${route}.ink`);
   const library = await runtime.page('index');
   const { articles } = await runtime.load('data/articles.js');
-  for (const article of articles) {
+  for (const article of articles.filter((item) => item.status !== 'draft')) {
     assert.equal(library.data.selectedId, article.id);
     if (article.audio) assert.equal(readFileSync(new URL(`.${article.audio}`, appRoot)).subarray(0, 4).toString(), 'OggS');
     press(library, 'ArrowDown');
@@ -1651,4 +1651,89 @@ test('an already confirmed binding with a stale local pending marker recovers af
   assert.deepEqual(calls, ['confirm', 'refresh']);
   assert.equal(zhisheng.getBinding().confirmationRequired, false);
   assert.equal(zhisheng.getBinding().token, 'new-access');
+});
+
+test('状态切换默认已发布，镜腿可访问草稿和全部', async () => {
+  const runtime = createRuntime({ base: null });
+  const page = await runtime.page('index');
+  assert.equal(page.data.articleStatus, 'published');
+  assert.equal(page.libraryPage.total, 6);
+  press(page, 'ArrowUp');
+  assert.equal(page.data.statusSelected, true);
+  press(page, 'Enter');
+  assert.equal(page.data.articleStatus, 'draft');
+  assert.equal(page.libraryPage.total, 1);
+  assert.equal(page.data.rows[0].statusLabel, '草稿');
+  assert.equal(page.data.rows[0].date, '2026-11-16');
+  page.openArticle(page.data.selectedId);
+  assert.match(runtime.navigation.at(-1), /status=draft/);
+  page.cycleStatus();
+  assert.equal(page.data.articleStatus, 'all');
+  assert.equal(page.libraryPage.total, 7);
+  page.cycleStatus();
+  assert.equal(page.data.articleStatus, 'published');
+});
+
+const draftItem = (index) => ({ id: 'draft-' + index, title: '草稿' + index, status: 'draft',
+  publishedAt: null, updatedAt: '2026-11-16', hasAudio: false });
+
+test('草稿分页和重开保持状态，切换时不会显示迟到的旧列表', async () => {
+  const late = deferred();
+  let delayPublished = false;
+  const calls = [];
+  const runtime = createRuntime({ modern: true, request: async (href, options) => {
+    calls.push(href);
+    const url = new URL(href);
+    if (url.searchParams.get('status') !== 'draft') return delayPublished ? late.promise : emptyLibrary();
+    const offset = Number(url.searchParams.get('offset'));
+    return json({ items: Array.from({ length: offset ? 1 : 12 }, (_, i) => draftItem(i + offset)), total: 13, limit: 12, offset });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  delayPublished = true;
+  page.loadLibrary(0);
+  page.cycleStatus(); await settle();
+  assert.equal(page.data.rows[0].statusLabel, '草稿');
+  late.resolve(json({ items: [{ id: 'published-1', title: '已发布', publishedAt: '2026-11-15', hasAudio: false }], total: 1, offset: 0, limit: 12 })); await settle();
+  assert.equal(page.data.rows[0].statusLabel, '草稿');
+  page.select(12); await settle();
+  assert.equal(page.data.selectedId, 'draft-12');
+  assert.match(calls.at(-1), /status=draft/);
+  page.onHide(); page.onShow(); await settle();
+  assert.equal(page.data.articleStatus, 'draft');
+  assert.equal(page.data.selectedId, 'draft-12');
+  page.openArticle('draft-12');
+  assert.match(runtime.navigation.at(-1), /status=draft/);
+  page.clearLibrary('授权已失效，请重新绑定。');
+  assert.equal(page.data.statusSelected, false);
+  assert.equal(page.data.articleStatus, 'published');
+  press(page, 'Enter');
+  assert.equal(runtime.navigation.at(-1), '/pages/pair/index');
+});
+
+test('草稿详情和音频取票携带正确来源，票据被拒绝时不复用缓存', async () => {
+  let rejected = false, downloads = 0;
+  const runtime = createRuntime({ modern: true, request: async (href, options) => {
+    if (href.includes('/read/articles/draft-1')) {
+      assert.match(href, /status=draft/);
+      return json({ ...draftItem(1), hasAudio: true, releaseId: 'draft-audio-1', contentVersion: 'draft-1:2', text: '草稿正文。' });
+    }
+    if (href.includes('/read/drafts/')) {
+      assert.deepEqual(JSON.parse(options.body), { audioId: 'draft-audio-1' });
+      return rejected ? json({ code: 'NOT_FOUND' }, 404)
+        : json({ url: origin + '/v1/zhiyue/media/draft-ticket', expires_in: 120 });
+    }
+    downloads++;
+    return new Response(new Uint8Array([1, 2, 3, 4]), { headers: { 'Content-Type': 'audio/mpeg', 'Content-Length': '4' } });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const item = await zhisheng.getArticle('draft-1', undefined, 'draft');
+  assert.equal(item.paragraphs[0], '草稿正文。');
+  await zhisheng.getAudioBuffer(item.releaseId, undefined, undefined, item);
+  await zhisheng.getAudioBuffer(item.releaseId, undefined, undefined, item);
+  assert.equal(downloads, 1);
+  rejected = true;
+  await assert.rejects(zhisheng.getAudioBuffer(item.releaseId, undefined, undefined, item), { code: 'not_found' });
 });

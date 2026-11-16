@@ -6,3 +6,4 @@ node_modules/
 !.env.example
 artifacts/device-binding-fix/work/
 artifacts/device-binding-fix/stage.json
+artifacts/article-status/work/

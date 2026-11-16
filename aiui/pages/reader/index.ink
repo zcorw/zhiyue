@@ -35,6 +35,7 @@ export default {
 
   onLoad(query = {}) {
     this.articleId = query.id;
+    this.articleStatus = query.status === 'draft' ? 'draft' : 'published';
     this.leaving = false;
     this.request = null;
     this.player = null;
@@ -83,7 +84,7 @@ export default {
     this.request = request;
     this.showMessage('正在加载文章…');
     try {
-      const article = await zhisheng.getArticle(this.articleId, request.signal);
+      const article = await zhisheng.getArticle(this.articleId, request.signal, this.articleStatus);
       if (this.request === request) {
         this.recoveryAttempts = 0;
         const binding = zhisheng.getBinding();
@@ -118,12 +119,13 @@ export default {
 
   showArticle(article) {
     const position = this.resumePosition;
-    const pageIndex = position && position.releaseId === article?.releaseId ? position.pageIndex : 0;
+    const version = article?.contentVersion ?? article?.releaseId;
+    const pageIndex = position && position.releaseId === version ? position.pageIndex : 0;
     this.resumePosition = null;
-    this.releaseId = article?.releaseId ?? null;
+    this.releaseId = version ?? null;
     this.pages = article ? paginate(article.paragraphs) : [];
     const audio = zhisheng.mode === 'live' && article?.hasAudio
-      ? (signal, isCancelled) => zhisheng.getAudioBuffer(article.releaseId, signal, isCancelled)
+      ? (signal, isCancelled) => zhisheng.getAudioBuffer(article.releaseId, signal, isCancelled, article)
       : article?.audio;
     this.player = audio ? createAudioController(
       audio,
@@ -134,14 +136,14 @@ export default {
         else if (error.code === 'audio_download') this.setData({ audioLabel: '音频下载失败 · 重试' });
         else if (error.code === 'audio_download_timeout') this.setData({ audioLabel: '音频下载超时 · 重试' });
         else if (error.code === 'audio_timeout' || error.code === 'audio_player') {
-          if (zhisheng.mode === 'live') zhisheng.forgetAudio(article.releaseId);
+          if (zhisheng.mode === 'live') zhisheng.forgetAudio(article.releaseId, article);
           this.setData({ audioLabel: error.code === 'audio_timeout' ? '播放器加载超时 · 重试' : '播放器加载失败 · 重试' });
         }
         else this.setData({ audioLabel: '音频地址获取失败 · 重试' });
       },
     ) : null;
     this.setData({
-      title: article?.title ?? '文章不可用',
+      title: article ? `${article.status === 'draft' ? '草稿 · ' : ''}${article.title}` : '文章不可用',
       hasBody: this.pages.length > 0,
       hasAudio: Boolean(this.player),
       audioLabel: this.player ? playbackLabel.idle : '无音频',

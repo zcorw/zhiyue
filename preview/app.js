@@ -1,3 +1,5 @@
+import { articleDate, filterArticleStatus } from '../aiui/lib/article-status.js';
+
 const byId = (id) => document.getElementById(id);
 const library = byId('library');
 const reader = byId('reader');
@@ -14,8 +16,10 @@ const audioIcon = byId('audio-icon');
 const audioLabel = byId('audio-label');
 const audioStatus = byId('audio-status');
 const media = byId('media');
+const articleStatus = byId('article-status');
 
 let articles = [];
+let allArticles = [];
 let entries = [];
 let selection = 0;
 let currentArticle = null;
@@ -35,6 +39,7 @@ function showDate(element, publishedAt) {
 }
 
 function renderLibrary() {
+  articleList.replaceChildren();
   entries = articles.map((article, index) => {
     const row = document.createElement('li');
     const entry = makeElement('button', 'article-entry', '');
@@ -50,8 +55,9 @@ function renderLibrary() {
 
     const meta = makeElement('span', 'entry-meta', '');
     const date = document.createElement('time');
-    showDate(date, article.publishedAt);
-    meta.append(date, makeElement('span', article.audio ? 'entry-audio' : '', article.audio ? '有音频' : '纯文字'));
+    showDate(date, articleDate(article));
+    meta.append(makeElement('span', '', article.status === 'draft' ? '草稿' : '已发布'), date,
+      makeElement('span', article.audio ? 'entry-audio' : '', article.audio ? '有音频' : '纯文字'));
 
     entry.append(copy, meta);
     row.append(entry);
@@ -77,8 +83,8 @@ function openArticle(index) {
   selectEntry(index);
   currentArticle = articles[index];
   page = 0;
-  readerTitle.textContent = currentArticle.title;
-  showDate(readerDate, currentArticle.publishedAt);
+  readerTitle.textContent = `${currentArticle.status === 'draft' ? '草稿 · ' : ''}${currentArticle.title}`;
+  showDate(readerDate, articleDate(currentArticle));
   renderPage();
   prepareAudio(currentArticle.audio);
 
@@ -188,6 +194,12 @@ async function toggleAudio() {
 }
 
 byId('back').addEventListener('click', closeArticle);
+function resetLibrary() {
+  articles = filterArticleStatus(allArticles, articleStatus.value);
+  byId('library-title').textContent = '全部文章';
+  renderLibrary();
+}
+articleStatus.addEventListener('change', resetLibrary);
 previousPage.addEventListener('click', () => changePage(-1));
 nextPage.addEventListener('click', () => changePage(1));
 audioToggle.addEventListener('click', toggleAudio);
@@ -195,6 +207,7 @@ window.addEventListener('pagehide', () => activeAudio?.pause());
 
 window.addEventListener('keydown', (event) => {
   if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.isComposing) return;
+  if (['INPUT', 'SELECT'].includes(event.target.tagName)) return;
 
   const backward = event.key === 'ArrowUp' || event.key === 'ArrowLeft';
   const forward = event.key === 'ArrowDown' || event.key === 'ArrowRight';
@@ -222,8 +235,8 @@ window.addEventListener('keydown', (event) => {
 
 try {
   const content = await import('../aiui/data/articles.js');
-  articles = [...content.articles].sort((left, right) => right.publishedAt.localeCompare(left.publishedAt));
-  renderLibrary();
+  allArticles = [...content.articles].sort((left, right) => articleDate(right).localeCompare(articleDate(left)));
+  resetLibrary();
 } catch {
   libraryStatus.textContent = '文章加载失败，请重新加载此页';
 }

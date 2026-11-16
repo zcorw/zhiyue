@@ -73,4 +73,14 @@ export const articles = [
     ],
     audio: null,
   },
+  {
+    id: 'draft-rain-notes',
+    status: 'draft',
+    title: '雨天札记（草稿演示）',
+    publishedAt: null,
+    updatedAt: '2026-11-16',
+    summary: '尚未发布的虚构笔记，用于验证状态筛选。',
+    paragraphs: ['雨声落在窗台上。这是一篇尚未发布的演示草稿。'],
+    audio: null,
+  },
 ];

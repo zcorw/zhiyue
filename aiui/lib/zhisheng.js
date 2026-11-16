@@ -119,7 +119,13 @@ function sameCredential(a, b) {
 }
 
 function validListItem(item) {
-  return isString(item?.id) && isString(item.title) && isString(item.publishedAt) && typeof item.hasAudio === 'boolean';
+  return isString(item?.id) && isString(item.title) && typeof item.hasAudio === 'boolean'
+    && (item.status === undefined || ['published', 'draft'].includes(item.status))
+    && (item.status === 'draft' ? item.publishedAt === null && isString(item.updatedAt) : isString(item.publishedAt));
+}
+
+function matchesStatus(item, status) {
+  return status === 'all' || (item.status ?? 'published') === status;
 }
 
 export function createZhishengClient({ origin, storage, request = (...args) => fetch(...args), now = Date.now }) {
@@ -498,9 +504,12 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         revoking.delete(binding.bindingId);
       }
     },
-    async listArticles(offset, signal) {
-      const page = await read(`/read/articles?limit=${articlePageSize}&offset=${offset}`, { signal });
-      if (!Array.isArray(page?.items) || !page.items.every(validListItem)
+    async listArticles(offset, signal, filters = {}) {
+      const status = filters.status ?? 'published';
+      if (!['published', 'draft', 'all'].includes(status)) throw new ZhishengError('bad_response');
+      const query = `${status !== 'published' ? `&status=${status}` : ''}${filters.q ? `&q=${encodeURIComponent(filters.q)}` : ''}${filters.category ? `&category=${encodeURIComponent(filters.category)}` : ''}`;
+      const page = await read(`/read/articles?limit=${articlePageSize}&offset=${offset}${query}`, { signal });
+      if (!Array.isArray(page?.items) || !page.items.every((item) => validListItem(item) && matchesStatus(item, status))
           || page.offset !== offset || page.limit !== articlePageSize
           || !Number.isSafeInteger(page.total) || page.total < 0
           || page.items.length !== Math.min(articlePageSize, Math.max(0, page.total - offset))) {
@@ -508,28 +517,32 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
       }
       return page;
     },
-    async getArticle(id, signal) {
-      const item = await read(`/read/articles/${encodeURIComponent(id)}`, { signal });
-      if (!validListItem(item) || item.id !== id || !isString(item.releaseId) || typeof item.text !== 'string') {
+    async getArticle(id, signal, status = 'published') {
+      if (!['published', 'draft', 'all'].includes(status)) throw new ZhishengError('bad_response');
+      const item = await read(`/read/articles/${encodeURIComponent(id)}${status === 'published' ? '' : `?status=${status}`}`, { signal });
+      if (!validListItem(item) || !matchesStatus(item, status) || item.id !== id || !isString(item.releaseId) || typeof item.text !== 'string') {
         throw new ZhishengError('bad_response');
       }
       return { ...item, paragraphs: item.text.split(/\r\n?|\n/) };
     },
-    forgetAudio(releaseId) {
-      audioCache.delete(releaseId);
+    forgetAudio(releaseId, source = {}) {
+      audioCache.delete(source.status === 'draft' ? `draft:${source.id}:${releaseId}` : releaseId);
     },
-    async getAudioBuffer(releaseId, signal, isCancelled = () => false) {
+    async getAudioBuffer(releaseId, signal, isCancelled = () => false, source = {}) {
       let binding = await ensureBinding();
+      const cacheKey = source.status === 'draft' ? `draft:${source.id}:${releaseId}` : releaseId;
       let ticket;
       try {
         // 命中也取票，确认当前绑定、发布版本和音频仍可访问。
-        ticket = await read(`/read/releases/${encodeURIComponent(releaseId)}/audio-ticket`, { method: 'POST', body: {}, signal });
+        const path = source.status === 'draft' ? `/read/drafts/${encodeURIComponent(source.id)}/audio-ticket`
+          : `/read/releases/${encodeURIComponent(releaseId)}/audio-ticket`;
+        ticket = await read(path, { method: 'POST', body: source.status === 'draft' ? { audioId: releaseId } : {}, signal });
         const current = readBinding();
         if (!sameBinding(current, binding)) throw new ZhishengError('auth_required');
         binding = current;
       } catch (error) {
         if (cachedBindingToken === binding.token && (error.code === 'not_found' || error.code === 'forbidden')) {
-          audioCache.delete(releaseId);
+          audioCache.delete(cacheKey);
         }
         throw error;
       }
@@ -543,9 +556,9 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
       const cachedBinding = readBinding();
       if (!sameBinding(cachedBinding, binding)) throw new ZhishengError('auth_required');
       binding = cachedBinding;
-      const cached = audioCache.get(releaseId);
+      const cached = audioCache.get(cacheKey);
       if (cached) {
-        audioCache.delete(releaseId);
+        audioCache.delete(cacheKey);
         let playback;
         try {
           playback = cached.slice(0);
@@ -553,7 +566,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
           // 无法再分配副本时，释放缓存并使用已有字节播放。
           return cached;
         }
-        audioCache.set(releaseId, cached);
+        audioCache.set(cacheKey, cached);
         return playback;
       }
 
@@ -591,7 +604,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
       if (!sameBinding(downloadedBinding, binding)) throw new ZhishengError('auth_required');
       binding = downloadedBinding;
       if (signal?.aborted || isCancelled()) throw new ZhishengError('audio_download');
-      rememberAudio(binding, releaseId, bytes);
+      rememberAudio(binding, cacheKey, bytes);
       return bytes;
     },
   };

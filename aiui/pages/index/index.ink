@@ -6,6 +6,8 @@
 
 <script setup>
 import wx from 'wx';
+import { articles } from '../../data/articles.js';
+import { articleStatuses, statusLabels, filterArticleStatus } from '../../lib/article-status.js';
 import { getArticleIndex, getLibraryView } from '../../lib/reading.js';
 import { articlePageSize, cancelTimer, createRequest, recoveryDelay, watchBindingExpiry, zhisheng } from '../../lib/zhisheng.js';
 
@@ -22,6 +24,9 @@ export default {
     canPair: false,
     canRetry: false,
     loading: false,
+    statusSelected: false,
+    articleStatus: 'published',
+    statusLabel: '已发布',
   },
 
   onLoad() {
@@ -33,7 +38,7 @@ export default {
     this.resumeSelection = null;
     this.retrySelection = null;
     this.recoveryAttempts = 0;
-    if (zhisheng.mode === 'demo') this.setData(getLibraryView(0));
+    if (zhisheng.mode === 'demo') this.showDemoLibrary();
     else this.setData({ live: true });
   },
 
@@ -52,7 +57,10 @@ export default {
       const sameBinding = binding.bindingId === this.binding?.bindingId && binding.account.id === this.binding?.account.id;
       if (sameBinding && this.request) return;
       if (sameBinding) this.rememberSelection();
-      else this.resumeSelection = null;
+      else {
+        this.resumeSelection = null;
+        this.setData({ articleStatus: 'published', statusLabel: '已发布', statusSelected: false });
+      }
       this.cancelRequest();
       this.hideArticles();
       this.binding = binding;
@@ -114,6 +122,7 @@ export default {
     this.resumeSelection = null;
     this.retrySelection = null;
     this.setData({ ...getLibraryView(0, { items: [] }), bound: false, accountSelected: false,
+      articleStatus: 'published', statusLabel: '已发布', statusSelected: false,
       canPair, canRetry: false, loading: false, message });
   },
 
@@ -145,11 +154,11 @@ export default {
     this.setData({ loading: true, canRetry: false, message: '正在加载文章…' });
     try {
       const offset = Math.floor(index / articlePageSize) * articlePageSize;
-      let page = await zhisheng.listArticles(offset, request.signal);
+      let page = await zhisheng.listArticles(offset, request.signal, { status: this.data.articleStatus });
       if (this.request !== request) return;
       if (page.total && page.total <= offset) {
         index = page.total - 1;
-        page = await zhisheng.listArticles(Math.floor(index / articlePageSize) * articlePageSize, request.signal);
+        page = await zhisheng.listArticles(Math.floor(index / articlePageSize) * articlePageSize, request.signal, { status: this.data.articleStatus });
       }
       if (this.request !== request) return;
       if (page.total && !page.items.length) throw new Error('library_changed');
@@ -185,10 +194,28 @@ export default {
     if (this.data.canRetry) this.loadLibrary(this.retryIndex, this.retrySelection);
   },
 
+  showDemoLibrary() {
+    const items = filterArticleStatus(articles, this.data.articleStatus);
+    this.libraryPage = { items, offset: 0, total: items.length };
+    this.setData({ ...getLibraryView(0, this.libraryPage), message: '', canRetry: false });
+  },
+
+  cycleStatus() {
+    if (this.data.live && !this.data.bound) return;
+    this.cancelRequest();
+    const status = articleStatuses[(articleStatuses.indexOf(this.data.articleStatus) + 1) % articleStatuses.length];
+    this.resumeSelection = null;
+    this.retrySelection = null;
+    this.hideArticles();
+    this.setData({ articleStatus: status, statusLabel: statusLabels[status], statusSelected: true, accountSelected: false });
+    if (this.data.live) this.loadLibrary(0);
+    else this.showDemoLibrary();
+  },
+
   select(index) {
     const page = this.libraryPage;
     if (!this.data.live) {
-      this.setData({ ...getLibraryView(index), message: '' });
+      this.setData({ ...getLibraryView(index, page ?? undefined), message: '' });
       return;
     }
     if (!page || this.request) return;
@@ -204,15 +231,20 @@ export default {
     if (event.code === 'ArrowUp' || event.code === 'ArrowDown') {
       event.preventDefault();
       const change = event.code === 'ArrowUp' ? -1 : 1;
-      if (this.data.live && this.data.bound && this.data.selectedIndex === 0 && change < 0) {
-        this.setData({ accountSelected: true });
+      if (this.data.statusSelected) {
+        if (change > 0) this.setData({ statusSelected: false, accountSelected: this.data.live && this.data.bound });
       } else if (this.data.accountSelected) {
-        if (change > 0) this.setData({ accountSelected: false });
+        if (change < 0) this.setData({ accountSelected: false, statusSelected: true });
+        else this.setData({ accountSelected: false });
+      } else if (this.data.selectedIndex === 0 && change < 0 && (!this.data.live || this.data.bound)) {
+        this.setData(this.data.live ? { accountSelected: true } : { statusSelected: true });
       } else {
         this.select(this.data.selectedIndex + change);
       }
     } else if (event.code === 'Enter') {
-      if (this.data.accountSelected || (!this.data.bound && this.data.canPair)) {
+      if (this.data.statusSelected) {
+        event.preventDefault(); this.cycleStatus();
+      } else if (this.data.accountSelected || (!this.data.bound && this.data.canPair)) {
         event.preventDefault();
         this.openAccount();
       } else if (this.data.canRetry) {
@@ -233,10 +265,11 @@ export default {
   openArticle(id) {
     const page = this.libraryPage;
     const liveIndex = page?.items.findIndex((item) => item.id === id) ?? -1;
-    const index = this.data.live ? liveIndex < 0 ? -1 : page.offset + liveIndex : getArticleIndex(id);
+    const index = page ? liveIndex < 0 ? -1 : page.offset + liveIndex : getArticleIndex(id);
     if (index < 0 || this.opening) return;
-    this.setData({ ...getLibraryView(index, page ?? undefined), message: '', accountSelected: false, canRetry: false });
-    this.navigate(`/pages/reader/index?id=${encodeURIComponent(id)}`);
+    this.setData({ ...getLibraryView(index, page ?? undefined), message: '', accountSelected: false, statusSelected: false, canRetry: false });
+    const status = page?.items[liveIndex]?.status ?? 'published';
+    this.navigate(`/pages/reader/index?id=${encodeURIComponent(id)}${status === 'draft' ? '&status=draft' : ''}`);
   },
 
   openAccount() {
@@ -264,16 +297,20 @@ export default {
         <button class="account {{accountSelected ? 'selected' : ''}}" ink:if="{{bound}}" bindtap="openAccount">账号</button>
       </view>
     </view>
+    <view class="status-bar" ink:if="{{!live || bound}}">
+      <button class="account {{statusSelected ? 'selected' : ''}}" bindtap="cycleStatus">状态：{{statusLabel}} · 切换</button>
+    </view>
     <view class="library">
-      <view class="row {{item.selected && !accountSelected ? 'selected' : ''}}" ink:for="{{rows}}" ink:key="id" data-id="{{item.id}}" bindtap="tapArticle">
+      <view class="row {{item.selected && !accountSelected && !statusSelected ? 'selected' : ''}}" ink:for="{{rows}}" ink:key="id" data-id="{{item.id}}" bindtap="tapArticle">
         <text class="title" data-id="{{item.id}}">{{item.title}}</text>
-        <text class="row-meta" data-id="{{item.id}}">{{item.date}} · {{item.audioLabel}}</text>
+        <text class="row-meta" data-id="{{item.id}}">{{item.statusLabel}} · {{item.date}} · {{item.audioLabel}}</text>
       </view>
       <text class="empty" ink:if="{{!rows.length && (!live || (bound && !message))}}">暂无文章</text>
       <button class="account bind" ink:if="{{live && !bound && canPair}}" bindtap="openAccount">绑定知声</button>
     </view>
     <view class="footer">
       <text class="meta" ink:if="{{message}}" bindtap="retry">{{message}}</text>
+      <text class="meta" ink:elif="{{statusSelected}}">单击切换已发布 / 草稿 / 全部 · 向下返回</text>
       <text class="meta" ink:elif="{{accountSelected}}">单击管理账号 · 向下返回文章</text>
       <text class="meta" ink:else>滑动选择 · 单击打开</text>
     </view>
@@ -300,6 +337,7 @@ export default {
   padding: 6px 0;
 }
 .header { border-bottom: 1px solid rgba(64,255,94,0.30); }
+.status-bar { display: flex; padding-top: 6px; flex-shrink: 0; }
 .footer { border-top: 1px solid rgba(64,255,94,0.30); }
 .heading { color: #40ff5e; font-size: 22px; font-weight: 600; line-height: 28px; }
 .meta, .row-meta { color: rgba(64,255,94,0.65); font-size: 14px; line-height: 20px; }
