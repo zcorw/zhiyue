@@ -1,47 +1,49 @@
-# 知阅 · Zhiyue
+# Zhiyue · 知阅
 
-面向 Rokid 使用场景、以文字为中心的独立沉浸式浏览项目。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-## 已确认的方向
+A standalone, text-first immersive reading application for Rokid glasses.
 
-- 项目名称：**知阅**；英文转写和目录标识采用 `Zhiyue` / `zhiyue`。
-- 采用独立页面，不作为知声 CMS 管理页面的附属视图。
-- 页面设计极简，主体以文字为主。
-- 仅使用少量图标标识状态或区域。
-- 用户要求建立新项目，并在该项目的新会话中开始后续设计与开发。
+## Confirmed direction
 
-## 当前状态
+- Product name: **知阅**; English name and directory identifier: Zhiyue / zhiyue.
+- A standalone interface, separate from the Zhisheng CMS management pages.
+- Minimal page design centered on text.
+- A small number of icons identify states or regions.
+- The user requested a separate project and a new project chat for subsequent design and development.
 
-目标设备为 Rokid スマートAIグラス 国际版，眼镜系统 1.28.016。眼镜端支持绑定知声账号、查看已发布文章、翻页及播放音频。真机已验证配对、阅读和 MP3 播放，1.0.8 调试版的音频内存缓存仍待真机复测。电脑预览使用内置演示数据。
+## Current status
 
-2026-11-13 已补齐知声新版确认、自动续期和失败恢复，并针对确认请求长期等待新增独立 10 秒截止时间与恢复处理，33 项 Node 模拟回归通过。用户已反馈本次绑定修复测试通过，具体环境与资源包版本待补录，完整真机及长期授权场景另行验收。[修复记录](docs/zhisheng-binding-diagnosis-2026-11-13.md#确认接口长期等待的第二次修复)和[源码包 v2](artifacts/zhiyue-aiui-binding-fix-v2.zip)。
+The local 2026-11-16 fix adds native persistent storage, a stable installation identifier, and matching Zhisheng changes that retain one binding per account and device installation. The connection page distinguishes permanent bindings from access-credential expiry. Use the [November 16 binding-fix source package](artifacts/zhiyue-device-binding-fix-20261116.zip). Results and limits are in the [fix report](docs/device-binding-fix-2026-11-16.md). Deployment, installation of the updated glasses package, and real-device testing across days remain pending.
 
-后续已完成 PR #2 的本地冲突整合，保留双方功能和 CI，52 项回归通过。整合后的源码以 `aiui/` 目录为准；v1/v2 ZIP 保留为此前交付快照。见[冲突处理记录](docs/merge-conflict-resolution-2026-11-13.md)。
+The target is Rokid Smart AI Glasses, international edition, running system 1.28.016. The glasses support Zhisheng account pairing, published-article browsing, pagination, and audio playback. Pairing, reading, and MP3 playback have prior real-device verification. The audio memory cache in debug version 1.0.8 still needs a device retest. The desktop preview uses built-in demonstration data.
 
-## 运行演示
+On 2026-11-13, local fixes added the new confirmation protocol, automatic renewal, failure recovery, and an independent 10-second deadline for hanging confirmation requests. All 33 Node simulation checks passed. The user reported that the binding fix passed, without specifying the exact environment or resource-package version; broader device and long-term authorization acceptance remains separate. See the [fix record](docs/zhisheng-binding-diagnosis-2026-11-13.md#确认接口长期等待的第二次修复) and the historical [v2 source snapshot](artifacts/zhiyue-aiui-binding-fix-v2.zip).
 
-在项目根目录运行：
+The later local integration of PR #2 preserved both feature sets and CI, with 52 passing regression checks. The integrated source is in the aiui directory; the v1/v2 ZIP files are historical snapshots. See the [conflict-resolution record](docs/merge-conflict-resolution-2026-11-13.md).
 
-```powershell
-node serve-preview.mjs
-```
+## Run the demonstration
 
-打开 [知阅电脑预览](http://127.0.0.1:4178/preview/)。可用鼠标操作，也可以用方向键选文或翻页，按 Enter 确认或控制播放，按 Esc 返回。「第一班电车之前」和「窗边的一小格光」提供朗读音频。
+From the project root:
 
-眼镜端工程在 [`aiui/`](aiui/)，供 AIUI Studio Global 本地导入。具体操作与验证状态见[演示说明](docs/demo.md)。
+    node serve-preview.mjs
 
-知声实数据接入的手机绑定流程、启用条件和验证边界见[知声接入记录](docs/stage-07-zhisheng-integration.md)。
+Open the [desktop preview](http://127.0.0.1:4178/preview/). Use the mouse or arrow keys to choose articles and turn pages, Enter to confirm or control playback, and Esc to return. “第一班电车之前” and “窗边的一小格光” include narration audio.
 
-先阅读 [会话交接](HANDOFF.md)、[待办](TODO.md) 和 [项目概览](docs/project-overview.md)。后续通过 `ai-project-architect` 分阶段明确平台、范围、流程、页面和工程约定；已确认的名称与视觉方向无需重复询问。
+Import the [aiui source directory](aiui/) locally into AIUI Studio Global for the glasses application. See the [demonstration guide](docs/demo.md) for operation and verification status.
 
-## 资料索引
+The phone-pairing flow, activation requirements, and real-data verification boundaries are in the [Zhisheng integration record](docs/stage-07-zhisheng-integration.md).
 
-- [项目概览](docs/project-overview.md)：目标、确认事实和待确认事项。
-- [设计原则](docs/design-principles.md)：文字优先和极简界面约束。
-- [架构草案](docs/architecture.md)：职责边界；技术选型待定。
-- [项目约定](docs/project-conventions.md)：当前工作方式与尚未确认的约定。
-- [语言约定](docs/stage-setup-language.md)记录已确认的三项语言选择。
-- [平台阶段记录](docs/stage-00-platform.md)跟踪设备、运行方式和输入的确认情况。
-- [首版范围记录](docs/stage-01-scope.md)记录文章、启动方式和验收范围。
-- [阅读与播放流程](docs/stage-02-flow.md)跟踪眼镜端交互与异常状态。
-- [AGENTS.md](AGENTS.md)：后续开发代理的项目规则。
+Start with the [handoff](HANDOFF.md), [task list](TODO.md), and [project overview](docs/project-overview.md). Continue platform, scope, flow, interface, and engineering decisions through the ai-project-architect stages; the confirmed name and visual direction do not need reconfirmation.
+
+## Documentation
+
+- [Project overview](docs/project-overview.md): goals, confirmed facts, and open decisions.
+- [Design principles](docs/design-principles.md): text-first and minimal-interface constraints.
+- [Architecture draft](docs/architecture.md): responsibility boundaries; final technology selection remains staged.
+- [Project conventions](docs/project-conventions.md): current practices and unresolved conventions.
+- [Language conventions](docs/stage-setup-language.md): the three confirmed language choices.
+- [Platform record](docs/stage-00-platform.md): device, execution, and input decisions.
+- [Initial scope](docs/stage-01-scope.md): articles, startup, and acceptance scope.
+- [Reading and playback flow](docs/stage-02-flow.md): glasses interaction and failure states.
+- [AGENTS.md](AGENTS.md): project rules for future development agents.

@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { createContext, SourceTextModule, SyntheticModule } from 'node:vm';
+import { webcrypto } from 'node:crypto';
 
 const origin = 'https://cms.example.test';
 const appRoot = new URL('../aiui/', import.meta.url);
@@ -22,7 +23,7 @@ function deferred() {
 }
 
 function createRuntime({ base = origin, request = () => assert.fail('没有预期网络请求'),
-  modern = false, storage = new Map(), startTime = 1_800_000_000_000, abortMode = 'standard' } = {}) {
+  modern = false, storage = new Map(), nativeStorage, startTime = 1_800_000_000_000, abortMode = 'standard' } = {}) {
   const timerQueue = new Map();
   const navigation = [];
   const players = [];
@@ -45,6 +46,10 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
   const wx = {
     navigateTo({ url, complete }) { navigation.push(url); complete?.(); },
     navigateBack() { navigation.push('back'); },
+    ...(nativeStorage ? {
+      getStorageSync: (key) => nativeStorage.get(key),
+      setStorageSync: (key, value) => nativeStorage.set(key, value),
+    } : {}),
   };
   const storageApi = {
     getItem: (key) => storage.get(key) ?? null,
@@ -63,6 +68,7 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
       ? json({ code: 'NOT_FOUND' }, 404) : request(href, options),
     Date: class extends Date { static now() { return clock; } },
     localStorage: storageApi,
+    crypto: webcrypto,
     setTimeout(action, delay) {
       const id = ++nextTimer;
       timerQueue.set(id, { action, due: clock + delay });
@@ -152,6 +158,74 @@ const modernGrant = (extra = {}) => ({ ...session, access_token: 'fictional-acce
   refresh_token: 'fictional-refresh', confirmation_required: true, ...extra });
 const emptyLibrary = () => json({ items: [], total: 0, offset: 0, limit: 12 });
 
+test('原生凭据跨运行时及一天后恢复，localStorage 清空也不重新配对', async () => {
+  const nativeStorage = new Map();
+  let pairRequests = 0;
+  let refreshes = 0;
+  const request = async (href) => {
+    if (href.endsWith('/authorize')) { pairRequests += 1; assert.fail('已绑定设备不应再次配对'); }
+    if (href.endsWith('/refresh')) {
+      refreshes += 1;
+      return json(modernGrant({ access_token: 'after-restart', confirmation_required: false }));
+    }
+    return emptyLibrary();
+  };
+  const first = createRuntime({ modern: true, nativeStorage, request });
+  const original = (await first.load('lib/zhisheng.js')).zhisheng;
+  original.saveBinding(renewable());
+  assert.equal(first.storage.size, 0, '凭据应保存在原生存储');
+  const next = createRuntime({ modern: true, nativeStorage, request, startTime: epoch + 2 * 86400000 });
+  const client = (await next.load('lib/zhisheng.js')).zhisheng;
+  assert.equal(client.getBinding().refreshToken, 'fictional-refresh');
+  const library = await next.page('index');
+  await settle();
+  assert.equal(library.data.bound, true);
+  assert.equal(client.getBinding().token, 'after-restart');
+  assert.equal(refreshes, 1);
+  assert.equal(pairRequests, 0);
+});
+
+test('原生存储兼容迁移旧凭据，写入失败不确认，注销不会恢复旧副本', async () => {
+  const nativeStorage = new Map();
+  const runtime = createRuntime({ modern: true, nativeStorage, request: async () => new Response(null, { status: 204 }) });
+  const key = `zhiyue.binding.v1:${origin}`;
+  const legacy = JSON.stringify(renewable());
+  runtime.storage.set(key, legacy);
+  const client = (await runtime.load('lib/zhisheng.js')).zhisheng;
+  const binding = client.getBinding();
+  assert.equal(nativeStorage.get(key), legacy);
+  await client.revokeBinding(binding);
+  runtime.storage.set(key, legacy);
+  assert.equal(client.getBinding(), null, '注销标记必须阻止旧存储副本恢复');
+  const { createPersistentStorage } = await runtime.load('lib/storage.js');
+  const broken = createPersistentStorage({ native: { getStorageSync: () => undefined, setStorageSync() {} }, legacy: runtime.storageApi });
+  assert.throws(() => broken.setItem(key, legacy), /did not persist/);
+});
+
+test('同一安装重启、解绑和再次配对使用同一设备标识，不同安装彼此隔离', async () => {
+  const nativeStorage = new Map();
+  const observed = [];
+  const request = async (href, options) => {
+    observed.push(options.headers['X-Zhiyue-Device-Id']);
+    if (options.method === 'DELETE') return new Response(null, { status: 204 });
+    return json({ device_code: 'fictional-device-code', user_code: 'ABCD-EFGH',
+      verification_uri: `${origin}/connections/zhiyue`, expires_in: 300, interval: 5 });
+  };
+  const first = createRuntime({ nativeStorage, request });
+  const a = (await first.load('lib/zhisheng.js')).zhisheng;
+  const id = a.getDeviceId();
+  a.saveBinding(renewable());
+  await a.revokeBinding(a.getBinding());
+  await a.beginPairing();
+  const second = createRuntime({ nativeStorage, request });
+  const b = (await second.load('lib/zhisheng.js')).zhisheng;
+  assert.equal(b.getDeviceId(), id);
+  await b.beginPairing();
+  assert.ok(observed.every((value) => value === id));
+  const other = createRuntime({ nativeStorage: new Map() });
+  assert.notEqual((await other.load('lib/zhisheng.js')).zhisheng.getDeviceId(), id);
+});
+
 test('兼容 main 已保存的待确认字段，旧标记不能被新字段绕过', async () => {
   const calls = [];
   const runtime = createRuntime({ modern: true, request: async (href, options) => {
@@ -175,7 +249,7 @@ test('兼容 main 已保存的待确认字段，旧标记不能被新字段绕�
   assert.equal(zhisheng.getBinding().confirmationRequired, true);
   await zhisheng.listArticles(0);
   assert.deepEqual(calls, ['confirm', 'refresh', 'read']);
-  const stored = JSON.parse([...runtime.storage.values()][0]);
+  const stored = JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`));
   assert.equal(stored.confirmationRequired, false);
   assert.equal(stored.pendingConfirmation, undefined);
 });
@@ -216,7 +290,7 @@ test('宿主忽略 timeout 和取消时，设备请求仍在十秒退出等待',
     await request;
     if (abortMode !== 'none') assert.equal(signal.aborted, true);
     assert.equal(runtime.timerQueue.size, 0);
-    assert.equal(runtime.storage.size, 0);
+    assert.equal(Number(runtime.storage.has(`zhiyue.binding.v1:${origin}`)), 0);
   });
 });
 
@@ -230,7 +304,7 @@ test('响应头已返回但 JSON 响应体挂起时也有截止时间，迟到�
   await request;
   body.resolve(modernGrant());
   await settle();
-  assert.equal(runtime.storage.size, 0);
+  assert.equal(Number(runtime.storage.has(`zhiyue.binding.v1:${origin}`)), 0);
   assert.equal(runtime.timerQueue.size, 0);
 });
 
@@ -245,7 +319,7 @@ test('确认已完成但 204 一直不返回时，用续期成功证明确认并
     }
     if (href.endsWith('/refresh')) {
       calls.push('refresh');
-      const saved = JSON.parse([...runtime.storage.values()][0]);
+      const saved = JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`));
       assert.equal(saved.confirmationRequired, true);
       assert.deepEqual(JSON.parse(options.body), { refresh_token: saved.refreshToken });
       return json(modernGrant({ access_token: 'recovered-confirm-access', confirmation_required: false }));
@@ -345,7 +419,7 @@ test('新版首次绑定先可靠保存、确认 204，再读取；不会直接�
       verification_uri: `${origin}/connections/zhiyue`, expires_in: 300, interval: 5 }, 201);
     if (path.endsWith('/token')) return json(modernGrant());
     if (path.endsWith('/confirm')) {
-      const saved = JSON.parse([...runtime.storage.values()][0]);
+      const saved = JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`));
       assert.equal(saved.refreshToken, 'fictional-refresh');
       assert.equal(saved.confirmationRequired, true);
       assert.deepEqual(JSON.parse(options.body), { refresh_token: saved.refreshToken });
@@ -361,7 +435,7 @@ test('新版首次绑定先可靠保存、确认 204，再读取；不会直接�
   await pair.startPairing();
   await runtime.advance(5000);
   assert.equal(runtime.navigation.at(-1), 'back');
-  assert.equal(JSON.parse([...runtime.storage.values()][0]).confirmationRequired, false);
+  assert.equal(JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`)).confirmationRequired, false);
   assert.equal(JSON.stringify(pair.data).includes('fictional-refresh'), false);
   const library = await runtime.page('index');
   await settle();
@@ -382,6 +456,7 @@ test('存储静默写入失败时不确认，撤销待确认绑定', async () =>
     else assert.fail('未预期的读取');
     return new Response(null, { status: 204 });
   } });
+  (await runtime.load('lib/zhisheng.js')).zhisheng.getDeviceId();
   runtime.storageApi.setItem = () => {};
   const pair = await runtime.page('pair');
   await pair.startPairing();
@@ -558,7 +633,7 @@ test('有效旧绑定自动升级，升级响应丢失且跨旧期限后重启�
   const request = async (href, options) => {
     if (href.endsWith('/upgrade')) {
       assert.equal(options.headers.Authorization, 'Bearer legacy-access');
-      const saved = JSON.parse([...runtime.storage.values()][0]);
+      const saved = JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`));
       assert.equal(saved.upgradePending, true);
       attempts += 1;
       if (attempts === 1) throw new Error('response lost');
@@ -845,8 +920,8 @@ test('手机配对轮询、读取全部文章及点击后申请单篇音频票�
   pair.onShow();
   await runtime.advance(5000);
   assert.equal(runtime.navigation.at(-1), 'back');
-  assert.equal(runtime.storage.size, 1);
-  const saved = JSON.parse([...runtime.storage.values()][0]);
+  assert.equal(Number(runtime.storage.has(`zhiyue.binding.v1:${origin}`)), 1);
+  const saved = JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`));
   assert.deepEqual(Object.keys(saved).sort(), ['account', 'bindingId', 'expiresAt', 'token']);
 
   library.onShow();
@@ -915,7 +990,7 @@ test('手机配对轮询、读取全部文章及点击后申请单篇音频票�
   press(reopened, 'Enter');
   await settle();
   assert.equal(reopened.data.audioLabel, '音频 HTTP 401 · 重试');
-  assert.equal(runtime.storage.size, 1);
+  assert.equal(Number(runtime.storage.has(`zhiyue.binding.v1:${origin}`)), 1);
   assert.equal(runtime.players.length, 3);
   press(reopened, 'Backspace');
   assert.equal(JSON.stringify([...runtime.storage.values()]).includes('ticket-1'), false);
@@ -1035,7 +1110,7 @@ test('取消播放时丢弃迟到票据，授权过期清空阅读状态', async
   await runtime.advance(1000);
   assert.equal(reader.data.hasBody, false);
   assert.match(reader.data.body, /授权已失效/);
-  assert.equal(runtime.storage.size, 0);
+  assert.equal(Number(runtime.storage.has(`zhiyue.binding.v1:${origin}`)), 0);
 });
 
 test('下载超时和返回列表都会取消音频响应体，迟到的字节不会播放或写入缓存', async () => {
@@ -1147,7 +1222,7 @@ test('恢复时重新授权后才显示列表和正文，并保留原位置', as
   assert.equal(reader.data.hasBody, false);
   await settle();
   assert.match(reader.data.body, /授权已失效/);
-  assert.equal(runtime.storage.size, 0);
+  assert.equal(Number(runtime.storage.has(`zhiyue.binding.v1:${origin}`)), 0);
   library.onShow();
   assert.equal(library.data.rows.length, 0);
   assert.equal(library.data.bound, false);
@@ -1258,9 +1333,13 @@ test('failed credential persistence is retryable and a fresh client restores exp
   let failWrite = false;
   let clock = 1_800_000_000_000;
   let count = 0;
+  const identityStorage = new Map();
   const storage = {
-    getItem: () => stored,
-    setItem: (_key, value) => { if (failWrite) throw new Error('disk'); stored = value; },
+    getItem: (key) => key.startsWith('zhiyue.device.') ? identityStorage.get(key) ?? null : stored,
+    setItem: (key, value) => {
+      if (key.startsWith('zhiyue.device.')) { identityStorage.set(key, value); return; }
+      if (failWrite) throw new Error('disk'); stored = value;
+    },
     removeItem: () => { stored = null; },
   };
   const request = async (href) => {
@@ -1321,7 +1400,7 @@ test('leaving pairing during claim revokes the late unstored grant', async () =>
   claim.resolve(json({ ...renewalSession, refresh_token: 'refresh' }));
   await poll;
   assert.deepEqual(revoked, [`Bearer ${session.access_token}`]);
-  assert.equal(runtime.storage.size, 0);
+  assert.equal(Number(runtime.storage.has(`zhiyue.binding.v1:${origin}`)), 0);
 });
 
 function pendingGrant() {
@@ -1369,9 +1448,13 @@ test('lost confirmation response and failed marker save survive restart and retr
   let raw = null;
   let failSave = false;
   let confirms = 0;
+  const identityStorage = new Map();
   const storage = {
-    getItem: () => raw,
-    setItem: (_key, value) => { if (failSave) throw new Error('disk'); raw = value; },
+    getItem: (key) => key.startsWith('zhiyue.device.') ? identityStorage.get(key) ?? null : raw,
+    setItem: (key, value) => {
+      if (key.startsWith('zhiyue.device.')) { identityStorage.set(key, value); return; }
+      if (failSave) throw new Error('disk'); raw = value;
+    },
     removeItem: () => { raw = null; },
   };
   const request = async (href) => {
@@ -1474,11 +1557,11 @@ test('pairing preserves uncertain confirmation, retries, and returns only after 
   await pair.startPairing();
   await runtime.advance(5000);
   assert.equal(runtime.navigation.length, 0);
-  assert.equal(JSON.parse([...runtime.storage.values()][0]).confirmationRequired, true);
+  assert.equal(JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`)).confirmationRequired, true);
   assert.equal(pair.data.action, '继续绑定');
   await runtime.advance(5000);
   assert.equal(runtime.navigation.at(-1), 'back');
-  assert.equal(JSON.parse([...runtime.storage.values()][0]).confirmationRequired, false);
+  assert.equal(JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`)).confirmationRequired, false);
 });
 
 test('领取后确认过程中关闭页面保留已保存授权，并且不会迟到导航', async () => {
@@ -1502,8 +1585,8 @@ test('领取后确认过程中关闭页面保留已保存授权，并且不会�
   confirm.resolve(new Response(null, { status: 204 }));
   await polling;
   assert.equal(revoked, 0);
-  assert.equal(runtime.storage.size, 1);
-  assert.equal(JSON.parse([...runtime.storage.values()][0]).confirmationRequired, false);
+  assert.equal(Number(runtime.storage.has(`zhiyue.binding.v1:${origin}`)), 1);
+  assert.equal(JSON.parse(runtime.storage.get(`zhiyue.binding.v1:${origin}`)).confirmationRequired, false);
   assert.equal(runtime.navigation.length, 0);
 });
 

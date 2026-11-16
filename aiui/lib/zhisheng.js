@@ -1,4 +1,5 @@
 import { zhishengEnabled, zhishengOrigin } from '../data/zhisheng-config.js';
+import { createPersistentStorage } from './storage.js';
 
 export const articlePageSize = 12;
 const pairErrors = new Set(['invalid_token', 'authorization_pending', 'slow_down', 'expired_token', 'access_denied', 'invalid_grant']);
@@ -133,13 +134,38 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
   }
   const mode = !origin ? 'demo' : base ? 'live' : 'invalid';
   const storageKey = `zhiyue.binding.v1:${base}`;
-  const store = () => storage ?? globalThis.localStorage;
+  const deviceKey = `zhiyue.device.v1:${base}`;
+  const persistentStorage = storage ?? createPersistentStorage();
+  const store = () => persistentStorage;
   const audioCache = new Map();
   let cachedBindingToken = null;
   let cacheExpiry = null;
   let lifecycle = null;
   let legacyUpgradeUnavailable = false;
   const revoking = new Set();
+
+  function getDeviceId() {
+    try {
+      let id = store().getItem(deviceKey);
+      if (id !== null) {
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+          throw new Error('Invalid saved device identity');
+        }
+        return id;
+      }
+      const bytes = new Uint8Array(16);
+      globalThis.crypto.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 15) | 64;
+      bytes[8] = (bytes[8] & 63) | 128;
+      const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+      id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+      store().setItem(deviceKey, id);
+      if (store().getItem(deviceKey) !== id) throw new Error('Device identity not persisted');
+      return id;
+    } catch {
+      throw new ZhishengError('storage');
+    }
+  }
 
   function clearAudioCache() {
     audioCache.clear();
@@ -248,6 +274,8 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
   async function performCall(path, { method = 'GET', body, binding, signal, revoke = false, empty = false } = {}) {
     if (mode !== 'live') throw new ZhishengError('configuration');
     const headers = { Accept: 'application/json' };
+    // 标识当前应用安装；不随解绑、账号切换、访问凭据轮换或重新配对改变。
+    headers['X-Zhiyue-Device-Id'] = getDeviceId();
     if (binding) headers.Authorization = `Bearer ${binding.token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     let response;
@@ -418,6 +446,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
   return {
     mode,
     getBinding: readBinding,
+    getDeviceId,
     saveBinding,
     ensureBinding,
     async beginPairing(signal) {
