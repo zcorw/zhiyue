@@ -14,7 +14,7 @@ A standalone, text-first immersive reading application for Rokid glasses.
 
 ## Current status
 
-The local article list now offers **Published / Draft / All**, defaulting to Published. Pagination retains the selected status; drafts use the latest saved content and saved audio, while publications retain their frozen snapshot. The [status-filter source package](artifacts/zhiyue-article-status-20261116.zip) requires the matching Zhisheng API update and migration. Client, isolated HTTP/database, contract, and desktop preview checks passed; deployment and glasses acceptance remain pending. See the [implementation record](docs/article-status-filter-2026-11-16.md).
+Draft-status filtering belongs only to the Zhisheng CMS article-management page. The mistakenly added glasses filter and draft access have been reverted; Zhiyue continues to read published articles. The long-term binding fix is retained. See the [scope correction](docs/cms-filter-scope-2026-11-16.md).
 
 The local 2026-11-16 fix adds native persistent storage, a stable installation identifier, and matching Zhisheng changes that retain one binding per account and device installation. The connection page distinguishes permanent bindings from access-credential expiry. Use the [November 16 binding-fix source package](artifacts/zhiyue-device-binding-fix-20261116.zip). Results and limits are in the [fix report](docs/device-binding-fix-2026-11-16.md). Deployment, installation of the updated glasses package, and real-device testing across days remain pending.
 

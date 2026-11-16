@@ -1,5 +1,4 @@
 import { articles } from '../data/articles.js';
-import { articleDate, filterArticleStatus } from './article-status.js';
 
 const rowsPerScreen = 3;
 const charactersPerPage = 84;
@@ -10,7 +9,7 @@ export function getArticle(id) {
   return articles.find((article) => article.id === id) ?? null;
 }
 
-export function getLibraryView(requestedIndex, { items = filterArticleStatus(articles), offset = 0, total = items.length } = {}) {
+export function getLibraryView(requestedIndex, { items = articles, offset = 0, total = items.length } = {}) {
   const selectedIndex = Math.min(Math.max(0, requestedIndex), Math.max(0, total - 1));
   const start = Math.floor(selectedIndex / rowsPerScreen) * rowsPerScreen;
   return {
@@ -20,8 +19,7 @@ export function getLibraryView(requestedIndex, { items = filterArticleStatus(art
     rows: items.slice(start - offset, start - offset + rowsPerScreen).map((article, index) => ({
       id: article.id,
       title: article.title,
-      date: articleDate(article).slice(0, 10),
-      statusLabel: article.status === 'draft' ? '草稿' : '已发布',
+      date: article.publishedAt.slice(0, 10),
       audioLabel: (article.hasAudio ?? Boolean(article.audio)) ? '有音频' : '纯文字',
       selected: start + index === selectedIndex,
     })),
