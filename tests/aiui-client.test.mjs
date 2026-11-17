@@ -23,7 +23,7 @@ function deferred() {
 }
 
 function createRuntime({ base = origin, request = () => assert.fail('没有预期网络请求'),
-  modern = false, storage = new Map(), nativeStorage, startTime = 1_800_000_000_000, abortMode = 'standard' } = {}) {
+  modern = false, storage = new Map(), nativeStorage, files, startTime = 1_800_000_000_000, abortMode = 'standard', cryptoApi = webcrypto } = {}) {
   const timerQueue = new Map();
   const navigation = [];
   const players = [];
@@ -68,7 +68,9 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
       ? json({ code: 'NOT_FOUND' }, 404) : request(href, options),
     Date: class extends Date { static now() { return clock; } },
     localStorage: storageApi,
-    crypto: webcrypto,
+    navigator: { storage: files },
+    TextDecoder,
+    crypto: cryptoApi,
     setTimeout(action, delay) {
       const id = ++nextTimer;
       timerQueue.set(id, { action, due: clock + delay });
@@ -158,6 +160,140 @@ const modernGrant = (extra = {}) => ({ ...session, access_token: 'fictional-acce
   refresh_token: 'fictional-refresh', confirmation_required: true, ...extra });
 const emptyLibrary = () => json({ items: [], total: 0, offset: 0, limit: 12 });
 
+function fileBackend() {
+  const contents = new Map();
+  const state = { failClose: false, gate: null, writes: 0 };
+  return {
+    contents, state,
+    async getDirectory() {
+      return {
+        async getFileHandle(name, { create }) {
+          if (!contents.has(name)) {
+            if (!create) throw Object.assign(new Error('missing'), { name: 'NotFoundError' });
+            contents.set(name, '');
+          }
+          return {
+            async getFile() { return new Blob([contents.get(name)]); },
+            async createWritable() {
+              let buffer = contents.get(name);
+              let position = 0;
+              return {
+                async truncate(size) { assert.equal(size, 0); buffer = ''; },
+                async seek(value) { position = value; },
+                async write(value) {
+                  // 模拟宿主覆盖短文本仍留旧尾部，必须由调用者显式截断。
+                  buffer = buffer.slice(0, position) + value + buffer.slice(position + value.length);
+                  position += value.length;
+                },
+                async close() {
+                  if (state.gate) await state.gate.promise;
+                  if (state.failClose) throw new Error('disk unavailable');
+                  contents.set(name, buffer); state.writes += 1;
+                },
+              };
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+test('键值存储随运行重置时，私有文件保持同一设备及可续期绑定，撤销不会从旧副本复活', async () => {
+  const files = fileBackend();
+  let pairings = 0;
+  const identities = [];
+  const request = async (href, options) => {
+    identities.push(options.headers['X-Zhiyue-Device-Id']);
+    if (href.endsWith('/authorize')) { pairings += 1; return json({ device_code: 'fictional-device-code', user_code: 'ABCD-EFGH',
+      verification_uri: `${origin}/connections/zhiyue`, expires_in: 300, interval: 5 }); }
+    if (href.endsWith('/confirm') || options.method === 'DELETE') return new Response(null, { status: 204 });
+    if (href.endsWith('/refresh')) return json(modernGrant({ access_token: 'new-access', confirmation_required: false }));
+    return json({ items: [{ id: 'article-1', title: '文件恢复的发布文章', publishedAt: '2026-11-17', hasAudio: false }],
+      total: 1, offset: 0, limit: 12 });
+  };
+  const first = createRuntime({ modern: true, files, nativeStorage: new Map(), cryptoApi: null, request });
+  const client = (await first.load('lib/zhisheng.js')).zhisheng;
+  await client.beginPairing();
+  await client.saveBinding(renewable({ confirmationRequired: true }));
+  await client.ensureBinding();
+  const id = client.getDeviceId();
+  const second = createRuntime({ modern: true, files, nativeStorage: new Map(), request, startTime: epoch + 2 * 86400000 });
+  const resumed = (await second.load('lib/zhisheng.js')).zhisheng;
+  const page = await second.page('index'); await settle();
+  assert.equal(page.data.rows[0]?.title, '文件恢复的发布文章');
+  assert.equal(resumed.getDeviceId(), id);
+  assert.equal(resumed.getBinding().token, 'new-access');
+  assert.equal(pairings, 1);
+  assert.ok(identities.every((value) => value === id));
+  const stale = JSON.stringify(resumed.getBinding());
+  await resumed.revokeBinding(resumed.getBinding());
+  const third = createRuntime({ modern: true, files, nativeStorage: new Map(), request });
+  third.storage.set(`zhiyue.binding.v1:${origin}`, stale);
+  const revoked = (await third.load('lib/zhisheng.js')).zhisheng;
+  await revoked.ready();
+  assert.equal(revoked.getBinding(), null);
+  assert.equal(revoked.getDeviceId(), id);
+  const disk = JSON.parse(files.contents.get('zhiyue-credentials-v1.json'));
+  assert.equal(disk.values[`zhiyue.binding.v1:${origin}`], '__zhiyue_removed_v1__');
+  page.onUnload();
+});
+
+test('私有文件关闭及回读校验前不确认绑定，文件写入失败保留恢复信息并禁止确认', async () => {
+  const files = fileBackend();
+  let confirms = 0;
+  const runtime = createRuntime({ modern: true, files, request: async (href) => {
+    if (href.endsWith('/confirm')) { confirms += 1; return new Response(null, { status: 204 }); }
+    return emptyLibrary();
+  } });
+  const client = (await runtime.load('lib/zhisheng.js')).zhisheng;
+  await client.ready();
+  files.state.gate = deferred();
+  const saving = client.saveBinding(renewable({ confirmationRequired: true }));
+  const confirming = client.ensureBinding();
+  await settle();
+  assert.equal(confirms, 0);
+  files.state.gate.resolve(); files.state.gate = null;
+  await saving; await confirming;
+  assert.equal(confirms, 1);
+  const brokenFiles = fileBackend();
+  const broken = createRuntime({ modern: true, files: brokenFiles, request: async () => { confirms += 1; assert.fail('未落盘不能请求'); } });
+  const pending = (await broken.load('lib/zhisheng.js')).zhisheng;
+  await pending.ready();
+  brokenFiles.state.failClose = true;
+  await assert.rejects(pending.saveBinding(renewable({ confirmationRequired: true })), { code: 'storage' });
+  await assert.rejects(pending.ensureBinding(), { code: 'storage' });
+  assert.equal(pending.getBinding().refreshToken, 'fictional-refresh');
+  assert.equal(confirms, 1);
+});
+
+test('私有文件迁移旧授权，读取损坏或后端不可用时不覆盖，也不显示为未绑定', async () => {
+  const files = fileBackend();
+  const runtime = createRuntime({ modern: true, files, nativeStorage: new Map() });
+  const raw = JSON.stringify(renewable());
+  runtime.storage.set(`zhiyue.binding.v1:${origin}`, raw);
+  const client = (await runtime.load('lib/zhisheng.js')).zhisheng;
+  await client.ready();
+  assert.equal(client.getBinding().refreshToken, 'fictional-refresh');
+  await settle();
+  const adapter = (await runtime.load('lib/storage.js')).createPersistentStorage({ files, legacy: runtime.storageApi, native: {} });
+  await adapter.ready();
+  assert.equal(adapter.getItem(`zhiyue.binding.v1:${origin}`), raw);
+  await adapter.flush();
+  assert.ok(files.contents.get('zhiyue-credentials-v1.json').includes('fictional-refresh'));
+  files.contents.set('zhiyue-credentials-v1.json', '{broken');
+  const corrupt = createRuntime({ modern: true, files });
+  const page = await corrupt.page('index'); await settle();
+  assert.equal(page.data.canPair, false);
+  assert.equal(page.data.message, '无法读取眼镜上的账号信息。');
+  assert.equal(files.contents.get('zhiyue-credentials-v1.json'), '{broken');
+  const unavailable = createRuntime({ files: { getDirectory: async () => { throw new Error('NotSupportedError'); } } });
+  const unavailablePage = await unavailable.page('pair'); await settle();
+  assert.equal(unavailablePage.data.action, '');
+  assert.equal(unavailablePage.data.message, '无法读取眼镜上的账号信息。');
+  page.onUnload(); unavailablePage.onUnload();
+});
+
 test('原生凭据跨运行时及一天后恢复，localStorage 清空也不重新配对', async () => {
   const nativeStorage = new Map();
   let pairRequests = 0;
@@ -202,6 +338,40 @@ test('原生存储兼容迁移旧凭据，写入失败不确认，注销不会�
   assert.throws(() => broken.setItem(key, legacy), /did not persist/);
 });
 
+test('wx 与 localStorage 共用底层时绑定、读文、跨日续期和撤销均保留正确状态', async () => {
+  const shared = new Map();
+  const request = async (href, options) => {
+    if (href.endsWith('/authorize')) return json({ device_code: 'fictional-device-code', user_code: 'ABCD-EFGH',
+      verification_uri: `${origin}/connections/zhiyue`, expires_in: 300, interval: 5 });
+    if (href.endsWith('/confirm') || options.method === 'DELETE') return new Response(null, { status: 204 });
+    if (href.endsWith('/refresh')) return json(modernGrant({ confirmation_required: false }));
+    return json({ items: [{ id: 'article-1', title: '共用存储的发布文章', publishedAt: '2026-11-17', hasAudio: false }],
+      total: 1, offset: 0, limit: 12 });
+  };
+  const first = createRuntime({ modern: true, storage: shared, nativeStorage: shared, cryptoApi: null, request });
+  const client = (await first.load('lib/zhisheng.js')).zhisheng;
+  const pair = await first.page('pair'); await pair.startPairing();
+  assert.equal(pair.data.userCode, 'ABCD-EFGH');
+  const id = client.getDeviceId();
+  client.saveBinding(renewable({ confirmationRequired: true }));
+  await client.ensureBinding();
+  const library = await first.page('index'); await settle();
+  assert.equal(library.data.rows[0]?.title, '共用存储的发布文章');
+  assert.equal(client.getBinding().confirmationRequired, false);
+  const next = createRuntime({ modern: true, storage: shared, nativeStorage: shared, cryptoApi: null, request, startTime: epoch + 2 * 86400000 });
+  const resumed = (await next.load('lib/zhisheng.js')).zhisheng;
+  const reopened = await next.page('index'); await settle();
+  assert.equal(reopened.data.rows[0]?.title, '共用存储的发布文章');
+  assert.equal(resumed.getDeviceId(), id);
+  await resumed.revokeBinding(resumed.getBinding());
+  assert.equal(resumed.getBinding(), null);
+  assert.equal(resumed.getDeviceId(), id);
+  const { createPersistentStorage } = await next.load('lib/storage.js');
+  const legacyOnly = createPersistentStorage({ native: {}, legacy: next.storageApi });
+  assert.equal(legacyOnly.getItem(`zhiyue.binding.v1:${origin}`), null, '旧接口也应识别撤销标记');
+  pair.onUnload(); library.onUnload(); reopened.onUnload();
+});
+
 test('同一安装重启、解绑和再次配对使用同一设备标识，不同安装彼此隔离', async () => {
   const nativeStorage = new Map();
   const observed = [];
@@ -224,6 +394,44 @@ test('同一安装重启、解绑和再次配对使用同一设备标识，不�
   assert.ok(observed.every((value) => value === id));
   const other = createRuntime({ nativeStorage: new Map() });
   assert.notEqual((await other.load('lib/zhisheng.js')).zhisheng.getDeviceId(), id);
+});
+
+test('Crypto 缺失或不可调用时仍可获取绑定码、加载文章并跨日恢复同一设备身份', async (t) => {
+  for (const [name, cryptoApi] of [['missing', null], ['no-method', {}],
+    ['unavailable', { getRandomValues() { throw new Error('Host API unavailable'); } }]]) {
+    await t.test(name, async () => {
+      const nativeStorage = new Map();
+      const calls = [];
+      const request = async (href, options) => {
+        calls.push({ href, id: options.headers['X-Zhiyue-Device-Id'] });
+        if (href.endsWith('/authorize')) return json({ device_code: 'fictional-device-code', user_code: 'ABCD-EFGH',
+          verification_uri: `${origin}/connections/zhiyue`, expires_in: 300, interval: 5 });
+        if (href.endsWith('/refresh')) return json(modernGrant({ confirmation_required: false }));
+        return json({ items: [{ id: 'article-1', title: '已发布文章', publishedAt: '2026-11-17', hasAudio: false }],
+          total: 1, offset: 0, limit: 12 });
+      };
+      const runtime = createRuntime({ modern: true, cryptoApi, nativeStorage, request });
+      const client = (await runtime.load('lib/zhisheng.js')).zhisheng;
+      const pair = await runtime.page('pair');
+      await pair.startPairing();
+      assert.equal(pair.data.userCode, 'ABCD-EFGH');
+      const id = calls[0].id;
+      assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      // 模拟眼镜上已有授权、但还没有新增安装标识的升级场景。
+      nativeStorage.delete(`zhiyue.device.v1:${origin}`);
+      client.saveBinding(renewable());
+      const library = await runtime.page('index'); await settle();
+      assert.equal(library.data.rows[0]?.title, '已发布文章');
+      const persistedId = client.getDeviceId();
+      const restarted = createRuntime({ modern: true, cryptoApi: webcrypto, nativeStorage, request, startTime: epoch + 2 * 86400000 });
+      const resumed = (await restarted.load('lib/zhisheng.js')).zhisheng;
+      const reopened = await restarted.page('index'); await settle();
+      assert.equal(reopened.data.rows[0]?.title, '已发布文章');
+      assert.equal(resumed.getDeviceId(), persistedId);
+      assert.ok(calls.slice(1).every((call) => call.id === persistedId));
+      pair.onUnload(); library.onUnload(); reopened.onUnload();
+    });
+  }
 });
 
 test('兼容 main 已保存的待确认字段，旧标记不能被新字段绕过', async () => {

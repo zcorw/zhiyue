@@ -25,10 +25,12 @@ export default {
     this.attempt = null;
     this.binding = null;
     this.recoveryAttempts = 0;
+    this.showVersion = 0;
   },
 
-  onShow() {
+  async onShow() {
     this.visible = true;
+    const showVersion = ++this.showVersion;
     if (this.closed) return;
     if (this.pairedWhileHidden) {
       this.returnToList();
@@ -40,6 +42,12 @@ export default {
     }
     if (this.operation) return;
     try {
+      if (!zhisheng.storageReady) {
+        this.setData({ message: '正在读取账号信息…', action: '' });
+        await zhisheng.ready();
+        if (!this.visible || this.closed || this.showVersion !== showVersion) return;
+        this.setData({ message: '使用手机浏览器完成绑定。', action: '开始绑定' });
+      }
       const binding = zhisheng.getBinding();
       if (binding?.confirmationRequired) this.resumeBinding();
       else if (binding) this.showBound(binding);
@@ -48,12 +56,14 @@ export default {
         this.showRetry('授权已失效，请重新绑定。');
       }
     } catch {
+      if (!this.visible || this.closed || this.showVersion !== showVersion) return;
       this.setData({ message: '无法读取眼镜上的账号信息。', action: '' });
     }
   },
 
   onHide() {
     this.visible = false;
+    this.showVersion += 1;
     this.clearPollTimer();
   },
 
@@ -207,7 +217,7 @@ export default {
     }
     this.attempt = null;
     try {
-      zhisheng.saveBinding(binding);
+      await zhisheng.saveBinding(binding);
     } catch {
       await zhisheng.revokeBinding(binding).catch(() => {});
       if (!this.closed) this.showRetry('无法保存账号，请重试或到知声网页检查绑定。');

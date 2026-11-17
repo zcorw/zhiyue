@@ -26,6 +26,8 @@ export default {
 
   onLoad() {
     this.opening = false;
+    this.visible = false;
+    this.showVersion = 0;
     this.request = null;
     this.libraryPage = null;
     this.binding = null;
@@ -37,13 +39,20 @@ export default {
     else this.setData({ live: true });
   },
 
-  onShow() {
+  async onShow() {
+    this.visible = true;
+    const showVersion = ++this.showVersion;
     if (zhisheng.mode === 'demo') return;
     if (zhisheng.mode !== 'live') {
       this.clearLibrary('知声地址配置无效。', false);
       return;
     }
     try {
+      if (!zhisheng.storageReady) {
+        this.setData({ message: '正在读取账号信息…', canPair: false, loading: true });
+        await zhisheng.ready();
+        if (!this.visible || this.showVersion !== showVersion) return;
+      }
       const binding = zhisheng.getBinding();
       if (!binding) {
         this.clearLibrary('绑定知声后可查看授权文章。');
@@ -60,11 +69,14 @@ export default {
       this.setData({ bound: true, canPair: true });
       this.loadLibrary(this.resumeSelection?.index ?? 0, this.resumeSelection);
     } catch {
+      if (!this.visible || this.showVersion !== showVersion) return;
       this.clearLibrary('无法读取眼镜上的账号信息。', false);
     }
   },
 
   onHide() {
+    this.visible = false;
+    this.showVersion += 1;
     if (zhisheng.mode === 'live') {
       this.rememberSelection();
       this.hideArticles();

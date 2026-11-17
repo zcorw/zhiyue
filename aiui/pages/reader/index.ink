@@ -36,6 +36,8 @@ export default {
   onLoad(query = {}) {
     this.articleId = query.id;
     this.leaving = false;
+    this.visible = false;
+    this.showVersion = 0;
     this.request = null;
     this.player = null;
     this.pages = [];
@@ -46,7 +48,9 @@ export default {
     if (zhisheng.mode === 'demo') this.showArticle(getArticle(this.articleId));
   },
 
-  onShow() {
+  async onShow() {
+    this.visible = true;
+    const showVersion = ++this.showVersion;
     if (zhisheng.mode === 'demo') return;
     if (zhisheng.mode !== 'live') {
       this.showMessage('知声地址配置无效。');
@@ -57,6 +61,11 @@ export default {
       return;
     }
     try {
+      if (!zhisheng.storageReady) {
+        this.showMessage('正在读取账号信息…');
+        await zhisheng.ready();
+        if (!this.visible || this.showVersion !== showVersion) return;
+      }
       const binding = zhisheng.getBinding();
       if (!binding) {
         this.expireBinding();
@@ -71,6 +80,7 @@ export default {
       this.watchAuthorization(binding);
       this.loadArticle();
     } catch {
+      if (!this.visible || this.showVersion !== showVersion) return;
       this.showMessage('无法读取眼镜上的账号信息。');
     }
   },
@@ -155,6 +165,8 @@ export default {
   },
 
   onHide() {
+    this.visible = false;
+    this.showVersion += 1;
     this.cancelLoad();
     cancelTimer(this.expiryTimer);
     this.expiryTimer = null;

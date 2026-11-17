@@ -144,6 +144,16 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
   let legacyUpgradeUnavailable = false;
   const revoking = new Set();
 
+  async function ready() {
+    try { await store().ready?.(); }
+    catch { throw new ZhishengError('storage'); }
+  }
+
+  async function flushStorage() {
+    try { await store().flush?.(); }
+    catch { throw new ZhishengError('storage'); }
+  }
+
   function getDeviceId() {
     try {
       let id = store().getItem(deviceKey);
@@ -154,7 +164,14 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         return id;
       }
       const bytes = new Uint8Array(16);
-      globalThis.crypto.getRandomValues(bytes);
+      try {
+        if (typeof globalThis.crypto?.getRandomValues !== 'function') throw new Error('Crypto unavailable');
+        globalThis.crypto.getRandomValues(bytes);
+      } catch {
+        // 安装标识只用于设备去重，不是凭据。旧宿主缺少 Crypto 时仍需保持可绑定、可读取。
+        // 访问及刷新凭据始终由知声签发，不使用这里的兼容随机数。
+        for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+      }
       bytes[6] = (bytes[6] & 15) | 64;
       bytes[8] = (bytes[8] & 63) | 128;
       const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
@@ -265,6 +282,8 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
     }
     if (readBinding()) throw new ZhishengError('binding_exists');
     writeBinding(binding);
+    // 配对调用者等待文件关闭和读回校验，之后才能确认服务端绑定。
+    if (store().flush) return flushStorage();
   }
 
   function call(path, options = {}) {
@@ -273,9 +292,12 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
 
   async function performCall(path, { method = 'GET', body, binding, signal, revoke = false, empty = false } = {}) {
     if (mode !== 'live') throw new ZhishengError('configuration');
+    if (store().isReady?.() === false) await ready();
     const headers = { Accept: 'application/json' };
     // 标识当前应用安装；不随解绑、账号切换、访问凭据轮换或重新配对改变。
     headers['X-Zhiyue-Device-Id'] = getDeviceId();
+    if (store().flush) await flushStorage();
+    if (signal?.aborted) throw new ZhishengError('network');
     if (binding) headers.Authorization = `Bearer ${binding.token}`;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     let response;
@@ -380,6 +402,7 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         current = replaceBinding(current, parseGrant(grant, current));
       }
       if (!sameCredential(readBinding(), current)) throw new ZhishengError('auth_required');
+      if (store().flush) await flushStorage();
       return current;
     } catch (error) {
       if (['invalid_token', 'invalid_grant', 'expired_token', 'access_denied'].includes(error.code)
@@ -393,8 +416,11 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
   }
 
   async function ensureBinding(forceRefresh = false) {
+    if (store().isReady?.() === false) await ready();
     const binding = readBinding();
+    if (store().flush) await flushStorage();
     if (!binding) throw new ZhishengError('auth_required');
+    if (!sameCredential(readBinding(), binding)) throw new ZhishengError('auth_required');
     if (revoking.has(binding.bindingId)) throw new ZhishengError('revoking');
     if (lifecycle) {
       const active = lifecycle;
@@ -445,6 +471,8 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
 
   return {
     mode,
+    get storageReady() { return store().isReady?.() !== false; },
+    ready,
     getBinding: readBinding,
     getDeviceId,
     saveBinding,
@@ -495,7 +523,8 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         const saved = readBinding();
         if (sameBinding(saved, binding)) removeBinding(saved);
       } finally {
-        revoking.delete(binding.bindingId);
+        try { if (store().flush) await flushStorage(); }
+        finally { revoking.delete(binding.bindingId); }
       }
     },
     async listArticles(offset, signal) {
