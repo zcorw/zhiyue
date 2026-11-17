@@ -15,6 +15,12 @@
         <p class="preview-label">电脑预览</p>
       </header>
 
+      <div class="tilt-preview">
+        <button type="button" id="simulate-tilt-left" class="control">模拟左歪头</button>
+        <button type="button" id="simulate-tilt-right" class="control">模拟右歪头</button>
+        <span class="quiet">仅定位翻页按钮，确认后才翻页。</span>
+      </div>
+
       <div class="display">
         <section id="library" aria-labelledby="library-title">
           <header class="display-header">
@@ -31,6 +37,11 @@
             <p class="quiet">仅测试虚构内容的匹配流程，不启用麦克风或调用 OpenAI。</p>
           </form>
           <ol id="article-list" class="article-list"></ol>
+          <nav class="pagination" aria-label="列表分页">
+            <button type="button" id="list-previous" class="control">上一页</button>
+            <span id="list-page-indicator" class="quiet" aria-live="polite"></span>
+            <button type="button" id="list-next" class="control">下一页</button>
+          </nav>
           <p id="library-status" class="quiet" role="status">正在加载文章</p>
           <noscript><p>请开启 JavaScript 后重新加载此页。</p></noscript>
         </section>
@@ -70,7 +81,7 @@
       </div>
 
       <footer class="keyboard-hints" aria-label="键盘操作提示">
-        <span><kbd>↑</kbd> <kbd>↓</kbd> 选文或翻页</span>
+        <span><kbd>↑</kbd> <kbd>↓</kbd> 移动焦点</span>
         <span><kbd>Enter</kbd> 确认或播放</span>
         <span><kbd>Esc</kbd> 返回</span>
       </footer>

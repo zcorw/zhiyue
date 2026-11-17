@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import { createContext, SourceTextModule, SyntheticModule } from 'node:vm';
+import { createContext, runInContext, SourceTextModule, SyntheticModule } from 'node:vm';
 import { webcrypto } from 'node:crypto';
 
 const origin = 'https://cms.example.test';
@@ -23,11 +23,14 @@ function deferred() {
 }
 
 function createRuntime({ base = origin, request = () => assert.fail('没有预期网络请求'),
-  modern = false, storage = new Map(), nativeStorage, files, startTime = 1_800_000_000_000, abortMode = 'standard', Recognition, cryptoApi = webcrypto } = {}) {
+  modern = false, storage = new Map(), nativeStorage, files, startTime = 1_800_000_000_000, abortMode = 'standard', Recognition, cryptoApi = webcrypto,
+  layout = { width: 280, height: 90 }, viewport, CanvasClass, pageCanvas, lexicalCanvas = false, legacyText = false, Orientation } = {}) {
   const timerQueue = new Map();
   const navigation = [];
   const players = [];
   const modules = new Map();
+  const warnings = [];
+  const canvasCalls = [];
   let clock = startTime;
   let nextTimer = 0;
   class Player {
@@ -44,6 +47,7 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
     destroy() { this.destroyed = true; }
   }
   const wx = {
+    createCanvasContext(id) { canvasCalls.push(id); return typeof pageCanvas === 'function' ? pageCanvas(id) : pageCanvas; },
     navigateTo({ url, complete }) { navigation.push(url); complete?.(); },
     navigateBack() { navigation.push('back'); },
     ...(nativeStorage ? {
@@ -57,6 +61,12 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
     removeItem: (key) => storage.delete(key),
   };
   const context = createContext({
+    window: viewport,
+    console: { warn: (...args) => warnings.push(args) },
+    AbsoluteOrientationSensor: Orientation,
+    Canvas: CanvasClass === undefined ? class {
+      getContext() { return { font: '', measureText: (text) => ({ width: Array.from(text).reduce((width, character) => width + (/^[\x00-\x7f]$/.test(character) ? 10 : 20), 0) }) }; }
+    } : CanvasClass,
     SpeechRecognition: Recognition,
     URL,
     AbortController: abortMode === 'standard' ? AbortController : undefined,
@@ -82,6 +92,8 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
       timerQueue.delete(id);
     },
   });
+  if (lexicalCanvas) runInContext('const Canvas = globalThis.Canvas; delete globalThis.Canvas;', context);
+  if (legacyText) runInContext('Intl = undefined; Array.prototype.at = undefined;', context);
 
   function getModule(identifier) {
     if (modules.has(identifier)) return modules.get(identifier);
@@ -122,10 +134,12 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
     }
     const instance = {
       ...logic, data: structuredClone(logic.data),
-      setData(patch) { Object.assign(this.data, patch); },
+      setData(patch, callback) { Object.assign(this.data, patch); callback?.(); },
+      querySelector(selector) { return selector === '#reading-area' && layout ? { clientWidth: layout.width, clientHeight: layout.height } : null; },
     };
     instance.onLoad(query);
     instance.onShow();
+    instance.onReady?.();
     return instance;
   }
 
@@ -139,7 +153,7 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
     }
   }
 
-  return { load, page, storage, storageApi, navigation, players, advance, timerQueue, now: () => clock };
+  return { load, page, storage, storageApi, navigation, players, advance, timerQueue, warnings, canvasCalls, now: () => clock };
 }
 
 function press(page, code) {
@@ -150,6 +164,21 @@ function press(page, code) {
 
 async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
+}
+
+// 新交互必须明确激活翻页按钮，选择本身不切换显示页。
+async function goToListIndex(page, index) {
+  for (let turns = 0; turns < 100; turns++) {
+    if (index >= page.data.screenStart && index < page.data.screenEnd) {
+      page.select(index);
+      return;
+    }
+    assert.equal(index < page.data.screenStart ? page.data.canPreviousListPage : page.data.canNextListPage, true);
+    if (index < page.data.screenStart) page.previousListPage();
+    else page.nextListPage();
+    await settle();
+  }
+  assert.fail('列表翻页未到达目标');
 }
 
 const epoch = 1_800_000_000_000;
@@ -884,7 +913,7 @@ test('续期后的页面计时器自动读取，保持选文与正文位置，�
   let renewals = 0;
   const items = [{ id: 'one', title: '第一篇', publishedAt: '2026-11-13', hasAudio: false },
     { id: 'two', title: '第二篇', publishedAt: '2026-11-13', hasAudio: false }];
-  const runtime = createRuntime({ modern: true, request: async (href) => {
+  const runtime = createRuntime({ modern: true, layout: { width: 280, height: 30 }, request: async (href) => {
     if (href.endsWith('/refresh')) {
       renewals += 1;
       return json(modernGrant({ access_token: `renewed-${renewals}`, confirmation_required: false }));
@@ -905,7 +934,7 @@ test('续期后的页面计时器自动读取，保持选文与正文位置，�
   library.onHide();
   const reader = await runtime.page('reader', { id: 'two' });
   await settle();
-  press(reader, 'ArrowDown');
+  reader.nextPage();
   await runtime.advance(86400000);
   await settle();
   assert.equal(reader.data.body, '第二段。');
@@ -1040,17 +1069,17 @@ test('演示模式保留文章、分页及本地音频', async () => {
   for (const route of appConfig.pages) await runtime.load(`${route}.ink`);
   const library = await runtime.page('index');
   const { articles } = await runtime.load('data/articles.js');
-  for (const article of articles) {
+  for (const [index, article] of articles.entries()) {
+    await goToListIndex(library, index);
     assert.equal(library.data.selectedId, article.id);
     if (article.audio) assert.equal(readFileSync(new URL(`.${article.audio}`, appRoot)).subarray(0, 4).toString(), 'OggS');
-    press(library, 'ArrowDown');
   }
   const reader = await runtime.page('reader', { id: articles[0].id });
   press(reader, 'Enter');
   const player = runtime.players[0];
   assert.equal(player.src, articles[0].audio);
   player.callbacks.ready();
-  press(reader, 'ArrowDown');
+  reader.nextPage();
   assert.equal(reader.data.pageIndex, 1);
   assert.equal(reader.data.audioLabel, '暂停');
   press(reader, 'Backspace');
@@ -1063,7 +1092,7 @@ test('手机配对轮询、读取全部文章及点击后申请单篇音频票�
   let audioTickets = 0;
   const audioBytes = Uint8Array.from([0xff, 0xf3, 0x84, 0xc0, 0, 1, 2, 3]);
   const download = deferred();
-  const runtime = createRuntime({ request: async (href, options) => {
+  const runtime = createRuntime({ layout: { width: 280, height: 30 }, request: async (href, options) => {
     const url = new URL(href);
     const path = url.pathname.replace('/v1/zhiyue', '');
     calls.push(path);
@@ -1137,8 +1166,7 @@ test('手机配对轮询、读取全部文章及点击后申请单篇音频票�
   await settle();
   assert.equal(library.data.countLabel, '1 / 15');
   for (let i = 1; i < 15; i += 1) {
-    press(library, 'ArrowDown');
-    await settle();
+    await goToListIndex(library, i);
     assert.equal(library.data.selectedId, `article-${i}`);
   }
   assert.equal(calls.filter((path) => path === '/read/articles').length, 2);
@@ -1147,7 +1175,7 @@ test('手机配对轮询、读取全部文章及点击后申请单篇音频票�
   library.onHide();
   const reader = await runtime.page('reader', { id: 'article-14' });
   await settle();
-  assert.equal(reader.data.body, '简体中文和日本語。');
+  assert.equal(reader.data.body.trimEnd(), '简体中文和日本語。');
   assert.equal(audioTickets, 0);
   press(reader, 'Enter');
   await settle();
@@ -1170,7 +1198,7 @@ test('手机配对轮询、读取全部文章及点击后申请单篇音频票�
   press(reader, 'Enter');
   assert.equal(player.plays, 2);
   assert.equal(audioTickets, 1);
-  press(reader, 'ArrowDown');
+  reader.nextPage();
   assert.equal(reader.data.body, '下一段。');
   player.callbacks.end();
   assert.equal(player.destroyed, true);
@@ -1376,7 +1404,7 @@ test('恢复时重新授权后才显示列表和正文，并保留原位置', as
   let detailResponse = detail();
   let listCalls = 0;
   let detailCalls = 0;
-  const runtime = createRuntime({ request: async (href, options) => {
+  const runtime = createRuntime({ layout: { width: 280, height: 30 }, request: async (href, options) => {
     assert.equal(options.headers.Authorization, 'Bearer read-token');
     if (href.includes('/read/articles?')) {
       listCalls += 1;
@@ -1410,7 +1438,7 @@ test('恢复时重新授权后才显示列表和正文，并保留原位置', as
 
   const reader = await runtime.page('reader', { id: 'two' });
   await settle();
-  press(reader, 'ArrowDown');
+  reader.nextPage();
   assert.equal(reader.data.body, '第二段。');
   reader.onHide();
   assert.equal(reader.data.body, '');
@@ -1929,7 +1957,7 @@ test('演示语音支持分类、多条列表、唯一文章打开及返回全�
   assert.equal(page.data.rows.length, 3);
   assert.equal(page.data.searchActive, true);
   assert.equal(runtime.navigation.length, 0);
-  page.select(3);
+  await goToListIndex(page, 3);
   assert.equal(page.data.selectedId, 'tea-at-dusk');
   page.openArticle(page.data.selectedId);
   assert.match(runtime.navigation.at(-1), /tea-at-dusk/);
@@ -1975,7 +2003,7 @@ test('真实检索唯一文章直接打开，分类分页和重新显示保持�
   await page.search('科技分类');
   assert.equal(page.data.heading, '科技');
   assert.equal(runtime.navigation.length, 1);
-  page.select(12); await settle();
+  await goToListIndex(page, 12);
   assert.equal(page.data.selectedId, 'voice-12');
   page.onHide(); page.onShow(); await settle();
   assert.match(requests.at(-1), /offset=12&category=science/);
@@ -2085,7 +2113,7 @@ test('未知分类取完整导航，跨屏选择精确分类并保持分页，�
   assert.equal(page.libraryPage.total, 15);
   assert.equal(page.data.heading, '全部分类');
   const beforeSelect = calls.length;
-  page.select(13);
+  await goToListIndex(page, 13);
   assert.equal(page.data.selectedId, 'category-13');
   assert.equal(calls.length, beforeSelect); // 分类导航自身不重复分页读取
   assert.equal(runtime.navigation.length, 0);
@@ -2094,7 +2122,7 @@ test('未知分类取完整导航，跨屏选择精确分类并保持分页，�
   assert.equal(page.data.heading, '分类13');
   assert.equal(page.data.selectedId, 'voice-0');
   assert.equal(runtime.navigation.length, 0);
-  page.select(12); await settle();
+  await goToListIndex(page, 12);
   assert.match(calls.at(-1), /offset=12&category=category-13/);
   page.onHide(); page.onShow(); await settle();
   assert.match(calls.at(-1), /offset=12&category=category-13/);
@@ -2236,4 +2264,393 @@ test('明确文章口令和引用标题以分类结尾时不误入分类回退',
     assert.equal(result.items[0].id, 'voice-0');
   }
   assert.equal(searchDemo(items, '查找文章不存在分类').total, 0);
+});
+
+test('列表选择和滑动只移动焦点，明确激活按钮才翻页且首尾不越界', async () => {
+  const runtime = createRuntime({ base: null });
+  const page = await runtime.page('index');
+  const firstRows = JSON.stringify(page.data.rows);
+  page.select(99);
+  assert.equal(page.data.selectedIndex, 2);
+  assert.equal(page.data.screenStart, 0);
+  page.openArticle('evening-bookshop');
+  assert.equal(runtime.navigation.length, 0, '隐藏项不能直接打开');
+  press(page, 'ArrowDown');
+  assert.equal(page.data.pageFocus, 'next');
+  assert.equal(page.data.screenStart, 0);
+  assert.equal(page.data.rows[0].id, JSON.parse(firstRows)[0].id);
+  press(page, 'Enter');
+  assert.equal(page.data.screenStart, 3);
+  assert.equal(page.data.selectedIndex, 3);
+  assert.equal(page.data.canNextListPage, false);
+  assert.equal(page.data.canPreviousListPage, true);
+  press(page, 'Enter');
+  assert.equal(page.data.screenStart, 3);
+  press(page, 'ArrowUp');
+  assert.equal(page.data.pageFocus, 'previous');
+  press(page, 'Enter');
+  assert.equal(page.data.screenStart, 0);
+  page.previousListPage();
+  assert.equal(page.data.screenStart, 0);
+  assert.equal(runtime.navigation.length, 0);
+});
+
+test('空列表与单屏检索禁用翻页，切换筛选从第一页开始', async () => {
+  const runtime = createRuntime({ base: null });
+  const page = await runtime.page('index');
+  page.nextListPage();
+  assert.equal(page.data.screenStart, 3);
+  await page.search('查看旅行分类');
+  assert.equal(page.data.screenStart, 0);
+  assert.equal(page.data.canPreviousListPage, false);
+  assert.equal(page.data.canNextListPage, false);
+  page.nextListPage();
+  assert.equal(page.data.selectedId, 'quiet-map');
+  await page.search('查找文章不存在');
+  assert.equal(page.data.rows.length, 0);
+  assert.equal(page.data.listPageLabel, '0 / 0');
+  page.focusListPage('next');
+  assert.equal(page.data.pageFocus, '', '空列表不将焦点困在禁用翻页按钮');
+  page.previousListPage(); page.nextListPage();
+  assert.equal(page.data.rows.length, 0);
+  page.showAll();
+  assert.equal(page.data.screenStart, 0);
+  assert.equal(page.data.canNextListPage, true);
+});
+
+test('容量分页连续容纳短段并拆长段，保留所有中日文和换行', async () => {
+  const runtime = createRuntime({ base: null });
+  const { layoutText, paginate } = await runtime.load('lib/reading.js');
+  const measureText = (text) => Array.from(text).reduce((width, char) => width + (/^[\x00-\x7f]$/.test(char) ? 1 : 2), 0);
+  const options = { width: 20, height: 30, lineHeight: 10, measureText };
+  const short = ['短段。', '短い段落。'];
+  assert.equal(paginate(short, options).length, 1, '段落结束不强制另起一页');
+  const paragraphs = ['  中文と日本語ABC。'.repeat(18), '', '末尾\n保留空行  '];
+  const layout = layoutText(paragraphs, options);
+  assert.equal(layout.map((page) => page.text).join(''), paragraphs.join('\n'));
+  assert.ok(layout.length > 2);
+  for (const [index, page] of layout.entries()) {
+    assert.ok(page.lines.every((line) => measureText(line) <= options.width));
+    assert.ok(page.lines.length <= 3);
+    if (index < layout.length - 1) assert.equal(page.lines.length, 3);
+  }
+  assert.ok(paginate(paragraphs, { ...options, width: 10 }).length > layout.length);
+  assert.throws(() => paginate(['文字'], { ...options, height: 5 }));
+  assert.throws(() => paginate(['文字'], { ...options, measureText: () => NaN }));
+  assert.throws(() => paginate(['文'], { ...options, width: 1 }));
+});
+
+test('容量分页不拆组合字符和Emoji，页拼接不丢失或重复字符', async () => {
+  const runtime = createRuntime({ base: null });
+  const { layoutText } = await runtime.load('lib/reading.js');
+  const text = 'e\u0301👩‍💻日本語🙂'.repeat(12);
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  const measureText = (value) => [...segmenter.segment(value)].length;
+  const pages = layoutText([text], { width: 4, height: 2, lineHeight: 1, measureText });
+  assert.equal(pages.map((page) => page.text).join(''), text);
+  for (const page of pages) {
+    assert.ok(page.lines.every((line) => measureText(line) <= 4));
+    assert.ok(page.lines.every((line) => !line.startsWith('\u0301') && !line.endsWith('\u200D')));
+  }
+});
+
+test('正文尺寸变化后按字符位置重排，不重建播放器；隐藏后不写回排版', async () => {
+  const layout = { width: 100, height: 60 };
+  const runtime = createRuntime({ base: null, layout });
+  const reader = await runtime.page('reader', { id: 'before-the-first-train' });
+  const player = reader.player;
+  reader.nextPage(); reader.nextPage();
+  const offset = reader.pages.slice(0, reader.data.pageIndex).join('').length;
+  const source = reader.pages.join('');
+  layout.width = 200;
+  reader.reflowArticle();
+  assert.equal(reader.player, player);
+  assert.equal(reader.pages.join(''), source);
+  const start = reader.pages.slice(0, reader.data.pageIndex).join('').length;
+  assert.ok(start <= offset && start + reader.data.body.length > offset);
+  const body = reader.data.body;
+  reader.onHide();
+  layout.width = 50;
+  reader.reflowArticle();
+  assert.equal(reader.data.body, body);
+});
+
+test('无法测量正文时可重试，恢复尺寸后无需重新请求文章', async () => {
+  const layout = { width: 0, height: 90 };
+  const runtime = createRuntime({ base: null, layout });
+  const reader = await runtime.page('reader', { id: 'quiet-map' });
+  assert.match(reader.data.body, /正在排版/);
+  await runtime.advance(100);
+  await runtime.advance(100);
+  assert.equal(reader.data.canRetry, true);
+  assert.equal(reader.data.bodyLines.length, 0);
+  assert.match(reader.data.body, /无法排版/);
+  layout.width = 280;
+  assert.equal(reader.data.pageFocus, 'retry');
+  press(reader, 'Enter');
+  assert.equal(reader.data.canRetry, false);
+  assert.equal(reader.data.pageFocus, '');
+  assert.ok(reader.data.bodyLines.length > 0);
+  const missing = createRuntime({ base: null, CanvasClass: null });
+  const unsupported = await missing.page('reader', { id: 'quiet-map' });
+  await missing.advance(100);
+  await missing.advance(100);
+  assert.equal(unsupported.data.canRetry, true);
+  assert.equal(unsupported.pages.length, 0);
+  assert.equal(missing.timerQueue.size, 0, '不无限等待缺失的能力');
+  assert.equal(unsupported.layoutDiagnostic.code, 'layout_measure_unavailable');
+  assert.deepEqual(missing.warnings, [['Zhiyue reading layout:', 'layout_measure_unavailable']]);
+});
+
+test('无Entity尺寸的宿主按实际窗口约束正文，页面Canvas保留原生测量', async () => {
+  const context = { font: '', measureText: (text) => ({ width: Array.from(text).length * 20 }) };
+  const viewport = { innerWidth: 640, innerHeight: 480 };
+  const runtime = createRuntime({ base: null, layout: null, viewport, CanvasClass: null, pageCanvas: context });
+  const reader = await runtime.page('reader', { id: 'before-the-first-train' });
+  assert.equal(reader.data.canRetry, false);
+  assert.ok(reader.pages.length);
+  assert.equal(reader.layoutDiagnostic.geometry, 'viewport');
+  assert.equal(reader.layoutDiagnostic.measurement, 'page-canvas');
+  assert.equal(reader.layoutDiagnostic.width, 592);
+  assert.equal(reader.layoutDiagnostic.height, 330);
+  assert.match(reader.data.readingAreaStyle, /width: 592px; height: 330px; flex: none;/);
+  assert.equal(context.font, '20px sans-serif');
+  assert.ok(runtime.canvasCalls.every((id) => id === 'reading-measure'));
+  const source = reader.paragraphs.join('\n');
+  assert.equal(reader.pages.join(''), source);
+  for (const lines of reader.linesByPage) {
+    assert.ok(lines.length <= 11);
+    assert.ok(lines.every((line) => context.measureText(line).width <= 592));
+  }
+  const player = reader.player;
+  reader.nextPage();
+  const offset = reader.pages.slice(0, reader.data.pageIndex).join('').length;
+  viewport.innerWidth = 400;
+  viewport.innerHeight = 300;
+  reader.reflowArticle();
+  assert.equal(reader.player, player);
+  assert.equal(reader.pages.join(''), source);
+  assert.match(reader.data.readingAreaStyle, /width: 352px; height: 150px;/);
+  const start = reader.pages.slice(0, reader.data.pageIndex).join('').length;
+  assert.ok(start <= offset && start + reader.data.body.length > offset);
+});
+
+test('内建Canvas未挂到全局属性或离屏接口故障时仍能测量', async () => {
+  const lexical = createRuntime({ base: null, lexicalCanvas: true });
+  const reader = await lexical.page('reader', { id: 'quiet-map' });
+  assert.ok(reader.pages.length);
+  assert.equal(reader.layoutDiagnostic.measurement, 'offscreen');
+  for (const CanvasClass of [class { constructor() { throw new Error('unsupported'); } }, class {
+    getContext() { return { measureText: () => ({ width: NaN }) }; }
+  }]) {
+    const runtime = createRuntime({ base: null, CanvasClass, pageCanvas: { measureText: (text) => ({ width: text.length * 20 }) } });
+    const page = await runtime.page('reader', { id: 'quiet-map' });
+    assert.ok(page.pages.length);
+    assert.equal(page.layoutDiagnostic.measurement, 'page-canvas');
+  }
+});
+
+test('渲染尚未就绪会有限重试，隐藏或替换正文取消迟到排版', async () => {
+  const layout = { width: 0, height: 90 };
+  const runtime = createRuntime({ base: null, layout });
+  const reader = await runtime.page('reader', { id: 'quiet-map' });
+  layout.width = 280;
+  await runtime.advance(100);
+  assert.ok(reader.pages.length, '首帧后的尺寸恢复无需手动重试');
+  assert.equal(reader.data.canRetry, false);
+  layout.width = 0;
+  reader.reflowArticle();
+  const delayed = [...runtime.timerQueue.values()][0].action;
+  reader.onHide();
+  assert.equal(runtime.timerQueue.size, 0);
+  const hiddenBody = reader.data.body;
+  await delayed();
+  assert.equal(reader.data.body, hiddenBody);
+  reader.onShow();
+  reader.showMessage('授权已失效');
+  await runtime.advance(1000);
+  assert.equal(reader.data.body, '授权已失效');
+  assert.equal(reader.pages.length, 0);
+});
+
+test('页面Canvas挂载延迟可恢复，测量无效不会无限等待或记录正文', async () => {
+  let mounted = false;
+  const runtime = createRuntime({ base: null, CanvasClass: null,
+    pageCanvas: () => mounted ? { measureText: (text) => ({ width: text.length * 20 }) } : null });
+  const reader = await runtime.page('reader', { id: 'quiet-map' });
+  mounted = true;
+  await runtime.advance(100);
+  assert.ok(reader.pages.length);
+  const broken = createRuntime({ base: null, CanvasClass: null, pageCanvas: {
+    measureText(text) { if (text === '阅A') return { width: 40 }; throw new Error(text); },
+  } });
+  const failed = await broken.page('reader', { id: 'quiet-map' });
+  assert.equal(failed.data.canRetry, true);
+  assert.equal(failed.layoutDiagnostic.code, 'layout_measure_failed');
+  assert.equal(broken.timerQueue.size, 0);
+  assert.deepEqual(broken.warnings, [['Zhiyue reading layout:', 'layout_measure_failed']]);
+});
+
+test('旧宿主缺少Intl及Array.at仍能完整排版组合字符', async () => {
+  const runtime = createRuntime({ base: null, legacyText: true });
+  const { layoutText } = await runtime.load('lib/reading.js');
+  const text = 'e\u0301👩‍💻日本語🙂'.repeat(8);
+  const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+  const measureText = (value) => [...segmenter.segment(value)].length;
+  const pages = layoutText([text], { width: 4, height: 2, lineHeight: 1, measureText });
+  assert.equal(pages.map((page) => page.text).join(''), text);
+  assert.ok(pages.every((page) => page.lines.every((line) => !line.startsWith('\u0301') && !line.endsWith('\u200D'))));
+});
+
+function orientationFixture() {
+  const sensors = [];
+  class Sensor {
+    constructor(options) { this.options = options; this.listeners = {}; sensors.push(this); }
+    addEventListener(name, callback) { this.listeners[name] = callback; }
+    start() { this.started = true; }
+    stop() { this.stopped = true; }
+    read(angle, axis = 2) {
+      const radians = angle * Math.PI / 360;
+      this.quaternion = [0, 0, 0, Math.cos(radians)];
+      this.quaternion[axis] = Math.sin(radians);
+      this.listeners.reading();
+    }
+    // 用户实机反馈：旧正号映射触发“下一页”的动作实际是左倾。
+    tiltLeft() { this.read(18); }
+    tiltRight() { this.read(-18); }
+  }
+  return { sensors, Sensor };
+}
+
+test('歪头稳定后只发一次焦点意图，回正才重置，点头转头不触发', async () => {
+  const runtime = createRuntime({ base: null });
+  const { createTiltFocus } = await runtime.load('lib/tilt-focus.js');
+  const { Sensor, sensors } = orientationFixture();
+  const focus = [], available = [];
+  let time = 0;
+  const tilt = createTiltFocus({ Sensor, now: () => time,
+    onFocus: (direction) => focus.push(direction), onAvailable: (value) => available.push(value) });
+  tilt.start(); tilt.start();
+  assert.equal(sensors.length, 1);
+  const sensor = sensors[0];
+  assert.equal(sensor.options.frequency, 20);
+  sensor.read(0);
+  sensor.read(25, 0); time += 300; sensor.read(25, 0);
+  sensor.read(25, 1); time += 300; sensor.read(25, 1);
+  assert.equal(focus.length, 0);
+  sensor.read(18); time += 100; sensor.read(18);
+  assert.equal(focus.length, 0);
+  time += 100; sensor.read(18);
+  assert.deepEqual(focus, ['previous']);
+  time += 1000; sensor.read(20); sensor.read(-20); time += 300; sensor.read(-20);
+  assert.equal(focus.length, 1);
+  sensor.read(0); time += 160; sensor.read(0);
+  sensor.read(-18); time += 200; sensor.read(-18);
+  assert.deepEqual(focus, ['previous', 'next']);
+  assert.equal(available[0], true);
+  tilt.stop();
+  assert.equal(sensor.stopped, true);
+  sensor.read(0); time += 1000; sensor.read(25);
+  assert.equal(focus.length, 2);
+});
+
+test('列表和正文歪头只选按钮，确认才翻页，隐藏后忽略迟到姿态', async () => {
+  const { Sensor, sensors } = orientationFixture();
+  const runtime = createRuntime({ base: null, Orientation: Sensor });
+  const library = await runtime.page('index');
+  sensors[0].read(0); sensors[0].tiltRight();
+  await runtime.advance(200); sensors[0].tiltRight();
+  assert.equal(library.data.pageFocus, 'next');
+  assert.equal(library.data.screenStart, 0);
+  assert.equal(runtime.navigation.length, 0);
+  press(library, 'Enter');
+  assert.equal(library.data.screenStart, 3);
+  library.onHide();
+  assert.equal(sensors[0].stopped, true);
+  sensors[0].tiltLeft(); await runtime.advance(300); sensors[0].tiltLeft();
+  assert.equal(library.data.screenStart, 3);
+  const reader = await runtime.page('reader', { id: 'before-the-first-train' });
+  sensors[1].read(0); sensors[1].tiltRight();
+  await runtime.advance(200); sensors[1].tiltRight();
+  assert.equal(reader.data.pageFocus, 'next');
+  assert.equal(reader.data.pageIndex, 0);
+  press(reader, 'Enter');
+  assert.equal(reader.data.pageIndex, 1);
+  press(reader, 'ArrowDown');
+  assert.equal(reader.data.pageFocus, 'audio');
+  press(reader, 'Enter');
+  assert.equal(reader.data.audioLabel, '载入中 · 取消');
+  reader.onHostBlur();
+  assert.equal(sensors[1].stopped, true);
+  reader.onHostFocus();
+  assert.equal(sensors.length, 3);
+});
+
+test('传感器缺失、构造或启动失败不破坏按钮操作，错误后停止采样', async () => {
+  const runtime = createRuntime({ base: null });
+  const { createTiltFocus } = await runtime.load('lib/tilt-focus.js');
+  for (const Sensor of [null, class { constructor() { throw new Error('unsupported'); } }, class {},
+    class { addEventListener() {} start() { throw new Error('denied'); } stop() {} }]) {
+    const available = [];
+    const tilt = createTiltFocus({ Sensor, onFocus: () => assert.fail('不能触发焦点'), onAvailable: (value) => available.push(value) });
+    assert.doesNotThrow(() => tilt.start());
+    assert.equal(available.at(-1), false);
+    assert.doesNotThrow(() => tilt.stop());
+  }
+  const { Sensor, sensors } = orientationFixture();
+  const pageRuntime = createRuntime({ base: null, Orientation: Sensor });
+  const library = await pageRuntime.page('index');
+  sensors[0].listeners.error({ error: 'unavailable' });
+  assert.equal(sensors[0].stopped, true);
+  assert.equal(library.data.tiltAvailable, false);
+  library.nextListPage();
+  assert.equal(library.data.screenStart, 3);
+});
+
+test('分类列表歪头定位沿用同一按钮模型，不直接翻页或打开文章', async () => {
+  const { Sensor, sensors } = orientationFixture();
+  const runtime = createRuntime({ modern: true, Orientation: Sensor, request: async (href) => {
+    if (href.endsWith('/read/search')) return json(searchPage([], { kind: 'category', noMatch: true }));
+    return json({ items: [], total: 0, offset: 0, limit: 12, navigation: categoryNavigation() });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const library = await runtime.page('index'); await settle();
+  await library.search('不存在分类');
+  sensors[0].read(0); sensors[0].tiltRight();
+  await runtime.advance(200); sensors[0].tiltRight();
+  assert.equal(library.data.categoriesActive, true);
+  assert.equal(library.data.screenStart, 0);
+  assert.equal(library.data.pageFocus, 'next');
+  press(library, 'Enter');
+  assert.equal(library.data.screenStart, 3);
+  assert.equal(library.data.categoriesActive, true);
+  assert.equal(runtime.navigation.length, 0);
+});
+
+test('按实机反馈校正左右倾：三类页面左倾上一页、右倾下一页，确认才激活', async () => {
+  for (const surface of ['articles', 'categories', 'reader']) {
+    const { Sensor, sensors } = orientationFixture();
+    const runtime = createRuntime({ base: null, Orientation: Sensor });
+    const page = await runtime.page(surface === 'reader' ? 'reader' : 'index', { id: 'before-the-first-train' });
+    if (surface === 'categories') await page.search('查看不存在分类');
+    const sensor = sensors[0];
+    const position = () => surface === 'reader' ? page.data.pageIndex : page.data.screenStart;
+    const start = position();
+    sensor.read(0);
+    sensor.tiltLeft(); await runtime.advance(200); sensor.tiltLeft();
+    assert.equal(page.data.pageFocus, 'previous', surface);
+    assert.equal(position(), start, surface + '左倾不能直接翻页');
+    press(page, 'Enter');
+    assert.equal(position(), start, surface + '首页不能越界');
+    sensor.read(0); await runtime.advance(160); sensor.read(0);
+    sensor.tiltRight(); await runtime.advance(200); sensor.tiltRight();
+    assert.equal(page.data.pageFocus, 'next', surface);
+    assert.equal(position(), start, surface + '右倾不能直接翻页');
+    const canNext = surface === 'reader' ? page.data.canGoForward : page.data.canNextListPage;
+    press(page, 'Enter');
+    assert.equal(position(), start + (canNext ? surface === 'reader' ? 1 : 3 : 0), surface + '只有确认才翻页');
+    assert.equal(runtime.navigation.length, 0);
+    page.onHide();
+  }
 });

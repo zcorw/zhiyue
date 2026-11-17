@@ -1,4 +1,5 @@
 import { searchDemo } from '../aiui/lib/search.js';
+import { rowsPerScreen, layoutText, pageAtOffset } from '../aiui/lib/reading.js';
 
 const byId = (id) => document.getElementById(id);
 const library = byId('library');
@@ -22,8 +23,10 @@ let allArticles = [];
 let categoriesActive = false;
 let entries = [];
 let selection = 0;
+let listStart = 0;
 let currentArticle = null;
 let page = 0;
+let readingPages = [];
 let activeAudio = null;
 
 function makeElement(tag, className, content) {
@@ -40,7 +43,8 @@ function showDate(element, publishedAt) {
 
 function renderLibrary() {
   articleList.replaceChildren();
-  entries = articles.map((article, index) => {
+  entries = articles.slice(listStart, listStart + rowsPerScreen).map((article, localIndex) => {
+    const index = listStart + localIndex;
     const row = document.createElement('li');
     const entry = makeElement('button', 'article-entry', '');
     entry.type = 'button';
@@ -69,13 +73,23 @@ function renderLibrary() {
   byId('article-count').textContent = categoriesActive ? articles.length + ' 个分类' : `${articles.length} 篇`;
   libraryStatus.hidden = entries.length > 0;
   libraryStatus.textContent = entries.length ? '' : '暂无文章';
-  selectEntry(0);
+  byId('list-previous').disabled = listStart === 0;
+  byId('list-next').disabled = listStart + rowsPerScreen >= articles.length;
+  byId('list-page-indicator').textContent = articles.length ? `${Math.floor(listStart / rowsPerScreen) + 1} / ${Math.ceil(articles.length / rowsPerScreen)}` : '0 / 0';
+  selectEntry(listStart);
 }
 
 function selectEntry(index) {
-  entries[selection]?.classList.remove('selected');
+  entries[selection - listStart]?.classList.remove('selected');
   selection = index;
-  entries[selection]?.classList.add('selected');
+  entries[selection - listStart]?.classList.add('selected');
+}
+
+function changeListPage(direction) {
+  const target = listStart + direction * rowsPerScreen;
+  if (target < 0 || target >= articles.length) return;
+  listStart = target;
+  renderLibrary();
 }
 
 function openArticle(index) {
@@ -85,6 +99,7 @@ function openArticle(index) {
     const category = articles[index];
     articles = allArticles.filter((item) => (item.category?.id ?? 'uncategorized') === category.id);
     categoriesActive = false;
+    listStart = 0;
     byId('library-title').textContent = category.title;
     renderLibrary();
     return;
@@ -94,11 +109,11 @@ function openArticle(index) {
   page = 0;
   readerTitle.textContent = currentArticle.title;
   showDate(readerDate, currentArticle.publishedAt);
-  renderPage();
-  prepareAudio(currentArticle.audio);
-
   library.hidden = true;
   reader.hidden = false;
+  readingPages = [];
+  reflowReading();
+  prepareAudio(currentArticle.audio);
   readerTitle.focus();
 }
 
@@ -109,22 +124,43 @@ function closeArticle() {
   currentArticle = null;
   reader.hidden = true;
   library.hidden = false;
-  entries[selection]?.focus();
+  entries[selection - listStart]?.focus();
 }
 
 function renderPage() {
-  const totalPages = currentArticle.paragraphs.length;
-  readerText.textContent = totalPages ? currentArticle.paragraphs[page] : '暂无正文';
+  const totalPages = readingPages.length;
+  readerText.textContent = totalPages ? readingPages[page].lines.map((line) => line || ' ').join('\n') : '暂无正文';
   pageIndicator.textContent = totalPages ? `${page + 1} / ${totalPages}` : '0 / 0';
   previousPage.disabled = page === 0;
   nextPage.disabled = page >= totalPages - 1;
+}
+
+function reflowReading() {
+  if (!currentArticle) return;
+  const offset = readingPages.slice(0, page).reduce((total, item) => total + item.text.length, 0);
+  const style = getComputedStyle(readerText);
+  const context = document.createElement('canvas').getContext('2d');
+  context.font = `${style.fontSize} ${style.fontFamily}`;
+  try {
+    readingPages = layoutText(currentArticle.paragraphs, { width: readerText.clientWidth,
+      height: readerText.clientHeight, lineHeight: Number.parseFloat(style.lineHeight),
+      measureText: (text) => context.measureText(text).width });
+    page = pageAtOffset(readingPages.map((item) => item.text), offset);
+    renderPage();
+  } catch {
+    readingPages = [];
+    readerText.textContent = '暂时无法排版，请调整窗口大小重试。';
+    previousPage.disabled = true;
+    nextPage.disabled = true;
+    pageIndicator.textContent = '';
+  }
 }
 
 function changePage(direction) {
   if (!currentArticle) return;
 
   const target = page + direction;
-  if (target < 0 || target >= currentArticle.paragraphs.length) return;
+  if (target < 0 || target >= readingPages.length) return;
   page = target;
   renderPage();
 }
@@ -208,6 +244,7 @@ byId('search-form').addEventListener('submit', (event) => {
   const result = searchDemo(allArticles, byId('search-text').value);
   categoriesActive = result.kind === 'categories';
   articles = result.items;
+  listStart = 0;
   byId('library-title').textContent = result.label;
   renderLibrary();
   if (categoriesActive) { libraryStatus.hidden = false; libraryStatus.textContent = result.total ? '未找到指定分类，请选择分类' : '暂无可用分类'; }
@@ -217,14 +254,20 @@ byId('search-form').addEventListener('submit', (event) => {
 byId('show-all').addEventListener('click', () => {
   categoriesActive = false;
   articles = allArticles;
+  listStart = 0;
   byId('search-text').value = '';
   byId('library-title').textContent = '全部文章';
   renderLibrary();
 });
+byId('list-previous').addEventListener('click', () => changeListPage(-1));
+byId('list-next').addEventListener('click', () => changeListPage(1));
+byId('simulate-tilt-left').addEventListener('click', () => (currentArticle ? previousPage : byId('list-previous')).focus());
+byId('simulate-tilt-right').addEventListener('click', () => (currentArticle ? nextPage : byId('list-next')).focus());
 previousPage.addEventListener('click', () => changePage(-1));
 nextPage.addEventListener('click', () => changePage(1));
 audioToggle.addEventListener('click', toggleAudio);
 window.addEventListener('pagehide', () => activeAudio?.pause());
+window.addEventListener('resize', reflowReading);
 
 window.addEventListener('keydown', (event) => {
   if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.isComposing) return;
@@ -236,10 +279,23 @@ window.addEventListener('keydown', (event) => {
     const step = forward ? 1 : -1;
     event.preventDefault();
     if (currentArticle) {
-      changePage(step);
+      const controls = [byId('back'), previousPage, nextPage, ...(audioToggle.hidden ? [] : [audioToggle])];
+      const index = controls.indexOf(event.target);
+      if (index < 0) (step < 0 ? previousPage : nextPage).focus();
+      else {
+        for (let target = index + step; target >= 0 && target < controls.length; target += step) {
+          if (!controls[target].disabled) { controls[target].focus(); break; }
+        }
+      }
     } else if (entries.length) {
-      const target = Math.min(entries.length - 1, Math.max(0, selection + step));
-      entries[target].focus();
+      const target = selection + step;
+      if (event.target.id === 'list-previous' || event.target.id === 'list-next') {
+        if (step < 0) entries.at(-1)?.focus();
+        else if (!byId('list-next').disabled) byId('list-next').focus();
+      } else if (target >= listStart + entries.length) {
+        if (!byId('list-next').disabled) byId('list-next').focus();
+        else if (!byId('list-previous').disabled) byId('list-previous').focus();
+      } else entries[Math.max(listStart, target) - listStart]?.focus();
     }
   } else if (currentArticle && (event.key === 'Escape' || event.key === 'Backspace')) {
     event.preventDefault();

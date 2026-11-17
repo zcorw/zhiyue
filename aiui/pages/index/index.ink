@@ -7,9 +7,10 @@
 <script setup>
 import wx from 'wx';
 import { articles } from '../../data/articles.js';
-import { getArticleIndex, getLibraryView } from '../../lib/reading.js';
+import { getArticleIndex, getLibraryView, rowsPerScreen } from '../../lib/reading.js';
 import { searchDemo, categoryPage } from '../../lib/search.js';
 import { createSpeechInput } from '../../lib/speech.js';
+import { createTiltFocus } from '../../lib/tilt-focus.js';
 import { articlePageSize, cancelTimer, createRequest, recoveryDelay, watchBindingExpiry, zhisheng } from '../../lib/zhisheng.js';
 
 export default {
@@ -30,6 +31,13 @@ export default {
     searchActive: false,
     categoriesActive: false,
     heading: '全部文章',
+    screenStart: 0,
+    screenEnd: 0,
+    listPageLabel: '0 / 0',
+    canPreviousListPage: false,
+    canNextListPage: false,
+    pageFocus: '',
+    tiltAvailable: false,
   },
 
   onLoad() {
@@ -51,12 +59,15 @@ export default {
       onState: (voiceState, message) => this.setData({ voiceState, message }),
       onText: (text) => this.search(text),
     });
+    this.tilt = createTiltFocus({ onFocus: (direction) => this.focusListPage(direction),
+      onAvailable: (tiltAvailable) => this.setData({ tiltAvailable }) });
     if (zhisheng.mode === 'demo') this.setData(getLibraryView(0));
     else this.setData({ live: true });
   },
 
   async onShow() {
     this.visible = true;
+    this.tilt.start();
     const showVersion = ++this.showVersion;
     if (zhisheng.mode === 'demo') return;
     if (zhisheng.mode !== 'live') {
@@ -92,6 +103,7 @@ export default {
 
   onHide() {
     this.visible = false;
+    this.tilt.stop();
     this.showVersion += 1;
     this.speech.cancel();
     if (this.data.voiceState !== 'idle') this.setData({ message: '' });
@@ -113,18 +125,22 @@ export default {
     this.retrySelection = null;
   },
 
+  onHostFocus() { if (this.visible) this.tilt.start(); },
+  onHostBlur() { this.tilt.stop(); },
+
   rememberSelection() {
     if (!this.libraryPage) return;
     this.resumeSelection = {
       index: this.data.selectedIndex,
       id: this.data.selectedId,
       accountSelected: this.data.accountSelected,
+      pageFocus: this.data.pageFocus,
     };
   },
 
   hideArticles() {
     this.libraryPage = null;
-    this.setData({ rows: [], selectedIndex: 0, selectedId: '', countLabel: '', accountSelected: false, canRetry: false });
+    this.setData({ ...getLibraryView(0, { items: [] }), countLabel: '', accountSelected: false, canRetry: false });
   },
 
   cancelRequest() {
@@ -204,7 +220,7 @@ export default {
       this.resumeSelection = null;
       this.retrySelection = null;
       this.setData({ ...this.listView(index, page), message: this.data.categoriesActive && !page.total ? '暂无可用分类，可重新检索或返回全部文章' : '',
-        accountSelected: selection?.accountSelected ?? this.data.accountSelected });
+        accountSelected: selection?.accountSelected ?? this.data.accountSelected, pageFocus: selection?.pageFocus ?? '' });
     } catch (error) {
       if (this.request !== request) return;
       if (error.code === 'auth_required') this.expireBinding();
@@ -234,7 +250,7 @@ export default {
     this.searchQuery = '';
     this.searchNoMatch = false;
     this.demoResults = null;
-    this.setData({ heading: '全部文章', searchActive: false, categoriesActive: false, searchSelected: false, voiceState: 'idle' });
+    this.setData({ heading: '全部文章', searchActive: false, categoriesActive: false, searchSelected: false, voiceState: 'idle', pageFocus: '' });
   },
 
   voiceSearch() {
@@ -242,7 +258,7 @@ export default {
     if (this.data.voiceState === 'listening') { this.speech.stop(); return; }
     if (this.data.voiceState === 'recognizing') return;
     this.cancelRequest();
-    this.setData({ searchSelected: true, accountSelected: false });
+    this.setData({ searchSelected: true, accountSelected: false, pageFocus: '' });
     this.speech.start();
   },
 
@@ -307,23 +323,55 @@ export default {
   },
 
   select(index) {
+    if (this.data.loading || !this.data.rows.length) return;
+    const target = Math.min(Math.max(this.data.screenStart, index), this.data.screenEnd - 1);
+    this.setData({ ...this.listView(target, this.libraryPage ?? undefined), message: '', canRetry: false,
+      accountSelected: false, searchSelected: false });
+  },
+
+  focusListPage(direction) {
+    if (!['previous', 'next'].includes(direction) || !this.data.rows.length || this.data.loading || this.data.voiceState !== 'idle'
+        || (this.data.live && !this.data.bound)) return;
+    this.setData({ pageFocus: direction, accountSelected: false, searchSelected: false });
+  },
+
+  previousListPage() { this.changeListPage(-1); },
+  nextListPage() { this.changeListPage(1); },
+
+  changeListPage(change) {
+    if (this.data.loading || this.data.voiceState !== 'idle' || this.request) return;
+    if (change < 0 ? !this.data.canPreviousListPage : !this.data.canNextListPage) return;
+    const target = this.data.screenStart + change * rowsPerScreen;
+    const pageFocus = change < 0 ? 'previous' : 'next';
     const page = this.libraryPage;
+    if (this.data.live && !this.data.categoriesActive
+        && (!page || target < page.offset || target >= page.offset + page.items.length)) {
+      this.loadLibrary(target, { pageFocus });
+    } else {
+      this.setData({ ...this.listView(target, page ?? undefined), pageFocus, message: '', canRetry: false,
+        searchSelected: false, accountSelected: false });
+    }
+  },
+
+  moveLibraryFocus(change) {
     if (this.data.loading) return;
-    if (this.data.categoriesActive && page) {
-      this.setData({ ...this.listView(index, page), message: '', canRetry: false });
-      return;
-    }
-    if (!this.data.live) {
-      this.setData({ ...getLibraryView(index, this.demoResults ? { items: this.demoResults } : undefined), message: '' });
-      return;
-    }
-    if (!page || this.request) return;
-    const target = Math.min(Math.max(0, index), Math.max(0, page.total - 1));
-    if (page.total && (target < page.offset || target >= page.offset + page.items.length)) {
-      this.loadLibrary(target);
-      return;
-    }
-    this.setData({ ...getLibraryView(target, page), message: '', canRetry: false });
+    if (this.data.pageFocus) {
+      if (change < 0) {
+        if (this.data.pageFocus === 'next' && this.data.canPreviousListPage) this.focusListPage('previous');
+        else this.select(this.data.screenEnd - 1);
+      } else if (this.data.canNextListPage) this.focusListPage('next');
+    } else if (this.data.searchSelected) {
+      if (change > 0) {
+        this.setData({ searchSelected: false, accountSelected: this.data.live && this.data.bound });
+      }
+    } else if (this.data.accountSelected) {
+      this.setData(change < 0 ? { accountSelected: false, searchSelected: true } : { accountSelected: false });
+    } else if (change < 0 && this.data.selectedIndex === this.data.screenStart) {
+      if (!this.data.live || this.data.bound) this.setData({ accountSelected: this.data.live, searchSelected: !this.data.live });
+    } else if (change > 0 && this.data.selectedIndex === this.data.screenEnd - 1) {
+      if (this.data.canPreviousListPage) this.focusListPage('previous');
+      else if (this.data.canNextListPage) this.focusListPage('next');
+    } else this.select(this.data.selectedIndex + change);
   },
 
   onKeyUp(event) {
@@ -339,21 +387,11 @@ export default {
     }
     if (event.code === 'ArrowUp' || event.code === 'ArrowDown') {
       event.preventDefault();
-      const change = event.code === 'ArrowUp' ? -1 : 1;
-      if (this.data.searchSelected) {
-        if (change > 0) this.setData({ searchSelected: false, accountSelected: this.data.live && this.data.bound });
-      } else if (this.data.accountSelected) {
-        if (change < 0) this.setData({ accountSelected: false, searchSelected: true });
-        else this.setData({ accountSelected: false });
-      } else if (this.data.live && this.data.bound && this.data.selectedIndex === 0 && change < 0) {
-        this.setData({ accountSelected: true });
-      } else if (this.data.selectedIndex === 0 && change < 0 && (!this.data.live || this.data.bound)) {
-        this.setData({ searchSelected: true });
-      } else {
-        this.select(this.data.selectedIndex + change);
-      }
+      this.moveLibraryFocus(event.code === 'ArrowUp' ? -1 : 1);
     } else if (event.code === 'Enter') {
-      if (this.data.searchSelected) {
+      if (this.data.pageFocus) {
+        event.preventDefault(); this.changeListPage(this.data.pageFocus === 'previous' ? -1 : 1);
+      } else if (this.data.searchSelected) {
         event.preventDefault(); this.voiceSearch();
       } else if (this.data.accountSelected || (!this.data.bound && this.data.canPair)) {
         event.preventDefault();
@@ -375,7 +413,7 @@ export default {
 
   openArticle(id) {
     const page = this.libraryPage;
-    if (this.data.loading) return;
+    if (this.data.loading || !this.data.rows.some((row) => row.id === id)) return;
     if (this.data.categoriesActive) {
       const category = page?.items.find((item) => item.id === id);
       if (!category) return;
@@ -428,7 +466,7 @@ export default {
       </view>
     </view>
     <view class="library">
-      <view class="row {{item.selected && !accountSelected && !searchSelected ? 'selected' : ''}}" ink:for="{{rows}}" ink:key="id" data-id="{{item.id}}" bindtap="tapArticle">
+      <view class="row {{item.selected && !accountSelected && !searchSelected && !pageFocus ? 'selected' : ''}}" ink:for="{{rows}}" ink:key="id" data-id="{{item.id}}" bindtap="tapArticle">
         <text class="title" data-id="{{item.id}}">{{item.title}}</text>
         <text class="row-meta" data-id="{{item.id}}">{{categoriesActive ? '' : item.date + ' · '}}{{item.audioLabel}}</text>
       </view>
@@ -436,7 +474,13 @@ export default {
       <button class="account bind" ink:if="{{live && !bound && canPair}}" bindtap="openAccount">绑定知声</button>
     </view>
     <view class="footer">
+      <view class="pagination" ink:if="{{!live || bound}}">
+        <button class="account {{pageFocus === 'previous' ? 'selected' : ''}}" disabled="{{!canPreviousListPage || loading}}" bindtap="previousListPage">上一页</button>
+        <text class="meta">{{listPageLabel}}</text>
+        <button class="account {{pageFocus === 'next' ? 'selected' : ''}}" disabled="{{!canNextListPage || loading}}" bindtap="nextListPage">下一页</button>
+      </view>
       <text class="meta" ink:if="{{message}}" bindtap="retry">{{message}}</text>
+      <text class="meta" ink:elif="{{pageFocus}}">单击{{pageFocus === 'previous' ? '上一页' : '下一页'}} · 滑动切换焦点</text>
       <text class="meta" ink:elif="{{accountSelected}}">单击管理账号 · 向下返回文章</text>
       <text class="meta" ink:elif="{{searchSelected}}">单击开始语音检索 · 向下返回</text>
       <text class="meta" ink:else>滑动选择 · 单击打开 · 向上选择语音</text>
@@ -464,12 +508,14 @@ export default {
   padding: 6px 0;
 }
 .header { border-bottom: 1px solid rgba(64,255,94,0.30); }
-.footer { border-top: 1px solid rgba(64,255,94,0.30); }
+.footer { border-top: 1px solid rgba(64,255,94,0.30); flex-direction: column; align-items: stretch; gap: 4px; }
+.pagination { display: flex; flex-direction: row; align-items: center; justify-content: space-between; }
 .heading { flex: 1; min-width: 0; color: #40ff5e; font-size: 22px; font-weight: 600; line-height: 28px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .meta, .row-meta { color: rgba(64,255,94,0.65); font-size: 14px; line-height: 20px; }
 .header-actions { display: flex; flex-direction: row; align-items: center; gap: 8px; }
 .account { padding: 4px 8px; color: #40ff5e; font-size: 14px; line-height: 18px; background-color: #000000; border: 1px solid rgba(64,255,94,0.38); border-radius: 4px; }
 .account.selected { border-width: 2px; border-color: #40ff5e; }
+.account:disabled { color: rgba(64,255,94,0.35); }
 .bind { width: 100%; }
 .library {
   flex: 1;
