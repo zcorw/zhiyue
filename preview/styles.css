@@ -92,6 +92,10 @@ h1 {
   list-style: none;
 }
 
+.search-form { display: grid; gap: 0.55rem; padding-block: 0.9rem; border-bottom: 1px solid var(--border); }
+.search-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.search-actions input { min-width: 10rem; flex: 1; padding: 0.55rem; border: 1px solid var(--border); border-radius: 0.35rem; background: var(--background); color: var(--text); font: inherit; }
+
 .article-entry,
 .control {
   border: 1px solid transparent;
@@ -253,6 +257,7 @@ button:focus-visible {
   margin-block-start: 0.95rem;
   font-size: 0.76rem;
 }
+
 
 kbd {
   padding: 0.05rem 0.24rem;

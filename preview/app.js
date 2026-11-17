@@ -1,3 +1,5 @@
+import { searchDemo } from '../aiui/lib/search.js';
+
 const byId = (id) => document.getElementById(id);
 const library = byId('library');
 const reader = byId('reader');
@@ -16,6 +18,8 @@ const audioStatus = byId('audio-status');
 const media = byId('media');
 
 let articles = [];
+let allArticles = [];
+let categoriesActive = false;
 let entries = [];
 let selection = 0;
 let currentArticle = null;
@@ -35,6 +39,7 @@ function showDate(element, publishedAt) {
 }
 
 function renderLibrary() {
+  articleList.replaceChildren();
   entries = articles.map((article, index) => {
     const row = document.createElement('li');
     const entry = makeElement('button', 'article-entry', '');
@@ -50,8 +55,10 @@ function renderLibrary() {
 
     const meta = makeElement('span', 'entry-meta', '');
     const date = document.createElement('time');
-    showDate(date, article.publishedAt);
-    meta.append(date, makeElement('span', article.audio ? 'entry-audio' : '', article.audio ? '有音频' : '纯文字'));
+    if (categoriesActive) date.textContent = article.categoryCount + ' 篇文章';
+    else showDate(date, article.publishedAt);
+    meta.append(date);
+    if (!categoriesActive) meta.append(makeElement('span', article.audio ? 'entry-audio' : '', article.audio ? '有音频' : '纯文字'));
 
     entry.append(copy, meta);
     row.append(entry);
@@ -59,7 +66,7 @@ function renderLibrary() {
     return entry;
   });
 
-  byId('article-count').textContent = `${articles.length} 篇`;
+  byId('article-count').textContent = categoriesActive ? articles.length + ' 个分类' : `${articles.length} 篇`;
   libraryStatus.hidden = entries.length > 0;
   libraryStatus.textContent = entries.length ? '' : '暂无文章';
   selectEntry(0);
@@ -74,6 +81,14 @@ function selectEntry(index) {
 function openArticle(index) {
   if (!articles[index]) return;
 
+  if (categoriesActive) {
+    const category = articles[index];
+    articles = allArticles.filter((item) => (item.category?.id ?? 'uncategorized') === category.id);
+    categoriesActive = false;
+    byId('library-title').textContent = category.title;
+    renderLibrary();
+    return;
+  }
   selectEntry(index);
   currentArticle = articles[index];
   page = 0;
@@ -188,6 +203,24 @@ async function toggleAudio() {
 }
 
 byId('back').addEventListener('click', closeArticle);
+byId('search-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const result = searchDemo(allArticles, byId('search-text').value);
+  categoriesActive = result.kind === 'categories';
+  articles = result.items;
+  byId('library-title').textContent = result.label;
+  renderLibrary();
+  if (categoriesActive) { libraryStatus.hidden = false; libraryStatus.textContent = result.total ? '未找到指定分类，请选择分类' : '暂无可用分类'; }
+  else if (!result.total) libraryStatus.textContent = '没有找到，可重新检索或返回全部';
+  if (result.kind === 'article' && result.total === 1) openArticle(0);
+});
+byId('show-all').addEventListener('click', () => {
+  categoriesActive = false;
+  articles = allArticles;
+  byId('search-text').value = '';
+  byId('library-title').textContent = '全部文章';
+  renderLibrary();
+});
 previousPage.addEventListener('click', () => changePage(-1));
 nextPage.addEventListener('click', () => changePage(1));
 audioToggle.addEventListener('click', toggleAudio);
@@ -195,6 +228,7 @@ window.addEventListener('pagehide', () => activeAudio?.pause());
 
 window.addEventListener('keydown', (event) => {
   if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.isComposing) return;
+  if (event.target.tagName === 'INPUT') return;
 
   const backward = event.key === 'ArrowUp' || event.key === 'ArrowLeft';
   const forward = event.key === 'ArrowDown' || event.key === 'ArrowRight';
@@ -223,6 +257,7 @@ window.addEventListener('keydown', (event) => {
 try {
   const content = await import('../aiui/data/articles.js');
   articles = [...content.articles].sort((left, right) => right.publishedAt.localeCompare(left.publishedAt));
+  allArticles = articles;
   renderLibrary();
 } catch {
   libraryStatus.textContent = '文章加载失败，请重新加载此页';

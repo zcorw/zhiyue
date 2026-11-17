@@ -30,7 +30,7 @@ const server = createServer(async (request, response) => {
   }
 
   const file = path === '/preview/' ? '/preview/index.html' : path;
-  const isPublicFile = /^\/(?:preview\/[a-zA-Z0-9_-]+\.(?:html|css|js|svg)|aiui\/data\/articles\.js|aiui\/assets\/[a-z0-9-]+\.ogg)$/.test(file);
+  const isPublicFile = /^\/(?:preview\/[a-zA-Z0-9_-]+\.(?:html|css|js|svg)|aiui\/data\/articles\.js|aiui\/lib\/search\.js|aiui\/assets\/[a-z0-9-]+\.ogg)$/.test(file);
   if (!isPublicFile) {
     response.writeHead(404).end();
     return;

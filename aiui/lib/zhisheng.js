@@ -527,14 +527,28 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
         finally { revoking.delete(binding.bindingId); }
       }
     },
-    async listArticles(offset, signal) {
-      const page = await read(`/read/articles?limit=${articlePageSize}&offset=${offset}`, { signal });
+    async listArticles(offset, signal, filters = {}) {
+      const query = `${filters.q ? `&q=${encodeURIComponent(filters.q)}` : ''}${filters.category ? `&category=${encodeURIComponent(filters.category)}` : ''}`;
+      const page = await read(`/read/articles?limit=${articlePageSize}&offset=${offset}${query}`, { signal });
       if (!Array.isArray(page?.items) || !page.items.every(validListItem)
           || page.offset !== offset || page.limit !== articlePageSize
           || !Number.isSafeInteger(page.total) || page.total < 0
           || page.items.length !== Math.min(articlePageSize, Math.max(0, page.total - offset))) {
         throw new ZhishengError('bad_response');
       }
+      return page;
+    },
+    async searchArticles(text, signal) {
+      const page = await read('/read/search', { method: 'POST', body: { text }, signal });
+      if (!Array.isArray(page?.items) || !page.items.every(validListItem)
+          || page.offset !== 0 || page.limit !== articlePageSize
+          || !Number.isSafeInteger(page.total) || page.total < 0
+          || page.items.length !== Math.min(articlePageSize, page.total)
+          || !['article', 'category', 'all'].includes(page.kind)
+          || typeof page.filters?.q !== 'string' || typeof page.filters?.category !== 'string'
+          || page.filters.q.length > 120 || page.filters.category.length > 64
+          || (page.noMatch !== undefined && typeof page.noMatch !== 'boolean')
+          || typeof page.label !== 'string') throw new ZhishengError('bad_response');
       return page;
     },
     async getArticle(id, signal) {

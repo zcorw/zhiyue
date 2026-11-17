@@ -2,6 +2,7 @@
 export const articles = [
   {
     id: 'before-the-first-train',
+    category: { id: 'daily', name: '日常' },
     title: '第一班电车之前',
     publishedAt: '2026-11-08',
     summary: '雨后清晨，去站台的路比往常安静。',
@@ -15,6 +16,7 @@ export const articles = [
   },
   {
     id: 'quiet-map',
+    category: { id: 'travel', name: '旅行' },
     title: '安静地图 · 静かな地図',
     publishedAt: '2026-11-06',
     summary: '给熟悉的小巷留一点空白。',
@@ -27,6 +29,7 @@ export const articles = [
   },
   {
     id: 'window-light',
+    category: { id: 'daily', name: '日常' },
     title: '窗边的一小格光',
     publishedAt: '2026-11-04',
     summary: '把桌子挪近窗边，给午后腾出一点时间。',
@@ -39,6 +42,7 @@ export const articles = [
   },
   {
     id: 'evening-bookshop',
+    category: { id: 'reading', name: '阅读' },
     title: '夕方の小さな本屋',
     publishedAt: '2026-11-02',
     summary: '閉店までの十分間、棚のあいだを歩く。',
@@ -51,6 +55,7 @@ export const articles = [
   },
   {
     id: 'returning-the-key',
+    category: { id: 'daily', name: '日常' },
     title: '归还一把钥匙',
     publishedAt: '2026-10-29',
     summary: '离开一间住过很久的房间。',
@@ -63,6 +68,7 @@ export const articles = [
   },
   {
     id: 'tea-at-dusk',
+    category: { id: 'daily', name: '日常' },
     title: '暮色里的茶 · 夕暮れのお茶',
     publishedAt: '2026-10-26',
     summary: '在天色变暗之前，把茶泡好。',

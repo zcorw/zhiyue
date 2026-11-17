@@ -23,7 +23,7 @@ function deferred() {
 }
 
 function createRuntime({ base = origin, request = () => assert.fail('没有预期网络请求'),
-  modern = false, storage = new Map(), nativeStorage, files, startTime = 1_800_000_000_000, abortMode = 'standard', cryptoApi = webcrypto } = {}) {
+  modern = false, storage = new Map(), nativeStorage, files, startTime = 1_800_000_000_000, abortMode = 'standard', Recognition, cryptoApi = webcrypto } = {}) {
   const timerQueue = new Map();
   const navigation = [];
   const players = [];
@@ -57,6 +57,7 @@ function createRuntime({ base = origin, request = () => assert.fail('没有预�
     removeItem: (key) => storage.delete(key),
   };
   const context = createContext({
+    SpeechRecognition: Recognition,
     URL,
     AbortController: abortMode === 'standard' ? AbortController : undefined,
     AbortSignal: abortMode === 'native' ? class {
@@ -1859,4 +1860,380 @@ test('an already confirmed binding with a stale local pending marker recovers af
   assert.deepEqual(calls, ['confirm', 'refresh']);
   assert.equal(zhisheng.getBinding().confirmationRequired, false);
   assert.equal(zhisheng.getBinding().token, 'new-access');
+});
+
+
+test('主动识别只提交最终文字，累计结果不重复，取消后忽略迟到事件', async () => {
+  const sessions = [];
+  class Recognition {
+    constructor() { sessions.push(this); }
+    start() { this.started = true; }
+    stop() { this.stopped = true; }
+    abort() { this.aborted = true; this.onend?.(); }
+  }
+  const runtime = createRuntime({ base: null, Recognition });
+  const { createSpeechInput } = await runtime.load('lib/speech.js');
+  const states = [], texts = [];
+  const speech = createSpeechInput({ onState: (...args) => states.push(args), onText: (text) => texts.push(text) });
+  speech.start(); speech.start();
+  assert.equal(sessions.length, 1);
+  const result = (text, isFinal) => Object.assign([{ transcript: text }], { isFinal });
+  sessions[0].onresult({ results: [result('查找', false)] });
+  speech.stop();
+  assert.equal(sessions[0].stopped, true);
+  sessions[0].onresult({ results: [result('查找', true), result('第一班电车之前', true)] });
+  sessions[0].onend();
+  assert.deepEqual(texts, ['查找第一班电车之前']);
+  assert.equal(runtime.timerQueue.size, 0);
+  speech.start();
+  speech.cancel();
+  sessions[1].onresult({ results: [result('迟到的识别', true)] });
+  sessions[1].onend();
+  assert.equal(texts.length, 1);
+  assert.equal(sessions[1].aborted, true);
+  speech.start();
+  sessions[2].onresult({ results: [result('文'.repeat(201), true)] });
+  sessions[2].onend();
+  assert.equal(texts.length, 1);
+  assert.match(states.at(-1)[1], /内容较长/);
+});
+
+test('识别权限拒绝、无语音和停止超时均释放会话并允许重试', async () => {
+  const sessions = [];
+  class Recognition {
+    constructor() { sessions.push(this); }
+    start() {}
+    stop() {}
+    abort() { this.aborted = true; }
+  }
+  const runtime = createRuntime({ base: null, Recognition });
+  const { createSpeechInput } = await runtime.load('lib/speech.js');
+  const states = [];
+  const speech = createSpeechInput({ onState: (...args) => states.push(args), onText: () => assert.fail('不应检索') });
+  speech.start(); sessions[0].onerror({ error: 'not-allowed' });
+  assert.match(states.at(-1)[1], /权限/);
+  speech.start(); sessions[1].onend();
+  assert.match(states.at(-1)[1], /没有听清/);
+  speech.start(); await runtime.advance(15000); await runtime.advance(5000);
+  assert.match(states.at(-1)[1], /超时/);
+  assert.ok(sessions.every((item) => item.aborted));
+  assert.equal(runtime.timerQueue.size, 0);
+});
+
+test('演示语音支持分类、多条列表、唯一文章打开及返回全部', async () => {
+  const runtime = createRuntime({ base: null });
+  const page = await runtime.page('index');
+  assert.ok(press(page, 'ArrowUp'));
+  assert.equal(page.data.searchSelected, true);
+  await page.search('查看日常分类');
+  assert.equal(page.data.rows.length, 3);
+  assert.equal(page.data.searchActive, true);
+  assert.equal(runtime.navigation.length, 0);
+  page.select(3);
+  assert.equal(page.data.selectedId, 'tea-at-dusk');
+  page.openArticle(page.data.selectedId);
+  assert.match(runtime.navigation.at(-1), /tea-at-dusk/);
+  await page.search('查找文章第一班电车之前');
+  assert.match(runtime.navigation.at(-1), /before-the-first-train/);
+  page.showAll();
+  assert.equal(page.data.heading, '全部文章');
+  assert.equal(page.data.searchActive, false);
+  assert.equal(page.data.rows.length, 3);
+});
+
+function searchPage(items, extra = {}) {
+  return { items, total: items.length, offset: 0, limit: 12, filters: { q: '', category: '' },
+    kind: 'article', label: '检索结果', resolvedBy: 'local', ...extra };
+}
+const voiceItem = (index) => ({ id: 'voice-' + index, title: '文章' + index, publishedAt: '2026-11-15', hasAudio: false });
+
+test('真实检索唯一文章直接打开，分类分页和重新显示保持同一筛选', async () => {
+  const requests = [];
+  let category = false;
+  const runtime = createRuntime({ modern: true, request: async (href, options) => {
+    requests.push(href);
+    if (href.endsWith('/read/search')) {
+      assert.deepEqual(JSON.parse(options.body), { text: category ? '科技分类' : '文章0' });
+      assert.equal(options.credentials, 'omit');
+      assert.equal(options.redirect, 'error');
+      return json(category ? searchPage(Array.from({ length: 12 }, (_, i) => voiceItem(i)),
+        { total: 13, kind: 'category', filters: { q: '', category: 'science' }, label: '科技' })
+        : searchPage([voiceItem(0)]));
+    }
+    if (href.includes('offset=12')) {
+      assert.match(href, /category=science/);
+      return json({ items: [voiceItem(12)], total: 13, limit: 12, offset: 12 });
+    }
+    return emptyLibrary();
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  await page.search('文章0');
+  assert.match(runtime.navigation.at(-1), /voice-0/);
+  category = true;
+  await page.search('科技分类');
+  assert.equal(page.data.heading, '科技');
+  assert.equal(runtime.navigation.length, 1);
+  page.select(12); await settle();
+  assert.equal(page.data.selectedId, 'voice-12');
+  page.onHide(); page.onShow(); await settle();
+  assert.match(requests.at(-1), /offset=12&category=science/);
+  assert.equal(page.data.heading, '科技');
+});
+
+test('隐藏或换账号后丢弃迟到检索，未知分类显示分类且换账号清除', async () => {
+  const pending = deferred();
+  let mode = 'pending';
+  let reads = 0;
+  const runtime = createRuntime({ modern: true, request: async (href) => {
+    if (href.endsWith('/read/search')) return mode === 'pending' ? pending.promise
+      : json(searchPage([], { kind: 'category', noMatch: true, label: '未找到分类' }));
+    reads++;
+    return json({ items: [], total: 0, offset: 0, limit: 12, navigation: { categories: [], uncategorizedCount: 0 } });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  const work = page.search('迟到');
+  page.onHide();
+  pending.resolve(json(searchPage([voiceItem(1)])));
+  await work;
+  assert.equal(runtime.navigation.length, 0);
+  assert.equal(page.data.rows.length, 0);
+  page.onShow(); await settle();
+  mode = 'unknown';
+  await page.search('不存在分类');
+  const previousReads = reads;
+  page.onHide(); page.onShow(); await settle();
+  assert.equal(reads, previousReads + 1);
+  assert.equal(page.data.categoriesActive, true);
+  assert.equal(page.data.heading, '全部分类');
+  assert.equal(page.data.rows.length, 0);
+  runtime.storage.clear();
+  zhisheng.saveBinding(renewable({ bindingId: 'new-binding', account: { id: 'new-user', displayName: '新账号' } }));
+  page.onShow(); await settle();
+  assert.equal(page.data.searchActive, false);
+  assert.equal(page.data.heading, '全部文章');
+});
+
+test('语义失败可以重试，旧服务明确提示更新，隐藏页面取消识别', async () => {
+  let session, calls = 0;
+  class Recognition { constructor() { session = this; } start() {} abort() { this.aborted = true; } }
+  const runtime = createRuntime({ modern: true, Recognition, request: async (href) => {
+    if (href.endsWith('/read/search')) {
+      calls++;
+      return calls === 1 ? json({ code: 'NOT_FOUND' }, 404) : json(searchPage([]));
+    }
+    return emptyLibrary();
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  await page.search('找文章');
+  assert.match(page.data.message, /需更新/);
+  assert.equal(page.data.canRetry, true);
+  page.retry(); await settle();
+  assert.equal(calls, 2);
+  page.voiceSearch();
+  page.onHide();
+  assert.equal(session.aborted, true);
+  assert.equal(page.data.voiceState, 'idle');
+});
+
+test('未知演示分类显示全部分类，选择后仅列该类文章；文章无匹配不回退分类', async () => {
+  const runtime = createRuntime({ base: null });
+  const page = await runtime.page('index');
+  await page.search('查看不存在分类');
+  assert.equal(page.data.heading, '全部分类');
+  assert.equal(page.data.categoriesActive, true);
+  assert.ok(page.data.rows.length > 0);
+  assert.equal(runtime.navigation.length, 0);
+  const selected = page.libraryPage.items[0];
+  page.openArticle(selected.id);
+  assert.equal(page.data.categoriesActive, false);
+  assert.equal(page.data.heading, selected.title);
+  assert.ok(page.libraryPage.items.every((item) => item.category.id === selected.id));
+  assert.equal(runtime.navigation.length, 0);
+  await page.search('查找文章绝不存在标题');
+  assert.equal(page.data.categoriesActive, false);
+  assert.equal(page.data.rows.length, 0);
+});
+
+const categoryNavigation = (count = 14) => ({
+  categories: Array.from({ length: count }, (_, i) =>
+    ({ id: 'category-' + i, name: '分类' + i, articleCount: i + 1 })),
+  uncategorizedCount: 2,
+});
+
+test('未知分类取完整导航，跨屏选择精确分类并保持分页，不误开文章', async () => {
+  const calls = [];
+  const runtime = createRuntime({ modern: true, request: async (href) => {
+    calls.push(href);
+    if (href.endsWith('/read/search')) return json(searchPage([], { kind: 'category', noMatch: true }));
+    const u = new URL(href), offset = Number(u.searchParams.get('offset'));
+    if (u.searchParams.get('category') === 'category-13') {
+      return json({ items: Array.from({ length: offset ? 1 : 12 }, (_, i) => voiceItem(offset + i)),
+        total: 13, offset, limit: 12 });
+    }
+    return json({ items: [], total: 0, offset: 0, limit: 12, navigation: categoryNavigation() });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  await page.search('未知分类');
+  assert.equal(page.libraryPage.total, 15);
+  assert.equal(page.data.heading, '全部分类');
+  const beforeSelect = calls.length;
+  page.select(13);
+  assert.equal(page.data.selectedId, 'category-13');
+  assert.equal(calls.length, beforeSelect); // 分类导航自身不重复分页读取
+  assert.equal(runtime.navigation.length, 0);
+  press(page, 'Enter'); await settle();
+  assert.equal(page.data.categoriesActive, false);
+  assert.equal(page.data.heading, '分类13');
+  assert.equal(page.data.selectedId, 'voice-0');
+  assert.equal(runtime.navigation.length, 0);
+  page.select(12); await settle();
+  assert.match(calls.at(-1), /offset=12&category=category-13/);
+  page.onHide(); page.onShow(); await settle();
+  assert.match(calls.at(-1), /offset=12&category=category-13/);
+  page.showAll(); await settle();
+  assert.equal(page.data.categoriesActive, false);
+  assert.equal(page.data.searchActive, false);
+  assert.doesNotMatch(calls.at(-1), /category=/);
+});
+
+test('分类导航缺失和失败不能用首屏冒充全部分类，重试可恢复', async () => {
+  let available = false;
+  const runtime = createRuntime({ modern: true, request: async (href) => {
+    if (href.endsWith('/read/search')) return json(searchPage([], { kind: 'category', noMatch: true }));
+    return json({ items: [], total: 0, offset: 0, limit: 12,
+      ...(available ? { navigation: categoryNavigation(1) } : {}) });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  await page.search('未知分类');
+  assert.equal(page.data.canRetry, true);
+  assert.equal(page.data.rows.length, 0);
+  available = true;
+  page.retry(); await settle();
+  assert.equal(page.data.canRetry, false);
+  assert.equal(page.data.categoriesActive, true);
+  assert.equal(page.libraryPage.total, 2);
+  page.select(1);
+  assert.equal(page.data.selectedId, 'uncategorized');
+});
+
+test('分类导航加载期间退出或新检索会丢弃迟到分类结果', async () => {
+  let pendingNavigation = false;
+  const pending = deferred();
+  const runtime = createRuntime({ modern: true, request: async (href, options) => {
+    if (href.endsWith('/read/search')) return JSON.parse(options.body).text === '未知分类'
+      ? json(searchPage([], { kind: 'category', noMatch: true }))
+      : json(searchPage([]));
+    return pendingNavigation ? pending.promise : emptyLibrary();
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  pendingNavigation = true;
+  const work = page.search('未知分类'); await settle();
+  await page.search('没有匹配文章');
+  pending.resolve(json({ items: [], total: 0, offset: 0, limit: 12, navigation: categoryNavigation() }));
+  await work;
+  assert.equal(page.data.categoriesActive, false);
+  assert.equal(page.data.heading, '检索结果');
+  assert.equal(page.data.rows.length, 0);
+});
+
+test('首次分类检索等待或失败时可返回全部，迟到响应不能覆盖列表', async () => {
+  for (const phase of ['search', 'navigation', 'failure']) {
+    let searching = false;
+    const pending = deferred();
+    const runtime = createRuntime({ modern: true, request: async (href) => {
+      if (href.endsWith('/read/search')) return phase === 'search' ? pending.promise
+        : json(searchPage([], { kind: 'category', noMatch: true }));
+      if (searching) {
+        if (phase === 'failure') throw new Error('network failed');
+        return pending.promise;
+      }
+      return json({ items: [voiceItem(0)], total: 1, offset: 0, limit: 12 });
+    } });
+    const { zhisheng } = await runtime.load('lib/zhisheng.js');
+    zhisheng.saveBinding(renewable());
+    const page = await runtime.page('index'); await settle();
+    searching = true;
+    const work = page.search('未知分类'); await settle();
+    assert.equal(page.data.searchActive, true);
+    assert.equal(phase === 'failure' ? page.data.canRetry : page.data.loading, true);
+    searching = false;
+    assert.equal(press(page, phase === 'navigation' ? 'Backspace' : 'Escape'), true, phase);
+    await settle();
+    assert.equal(page.searchQuery, '');
+    assert.equal(page.data.heading, '全部文章');
+    assert.equal(page.data.selectedId, 'voice-0');
+    pending.resolve(phase === 'search' ? json(searchPage([], { kind: 'category', noMatch: true }))
+      : json({ items: [], total: 0, offset: 0, limit: 12, navigation: categoryNavigation() }));
+    await work;
+    assert.equal(page.data.categoriesActive, false);
+    assert.equal(page.data.searchActive, false);
+    assert.equal(page.data.loading, false);
+    assert.equal(page.data.canRetry, false);
+    assert.equal(page.data.selectedId, 'voice-0');
+    assert.equal(runtime.navigation.length, 0);
+  }
+});
+
+test('分类导航参数校验、去重和空分类显示边界', async () => {
+  const runtime = createRuntime({ base: null });
+  const { categoryPage } = await runtime.load('lib/search.js');
+  assert.throws(() => categoryPage({ categories: [], uncategorizedCount: -1 }));
+  assert.throws(() => categoryPage({ categories: [{ id: 'x', name: 'x', articleCount: '1' }], uncategorizedCount: 0 }));
+  const result = categoryPage({ categories: [
+    { id: 'x', name: 'x', articleCount: 1 }, { id: 'x', name: 'x', articleCount: 1 },
+    { id: 'y', name: 'y', articleCount: 0 }], uncategorizedCount: 0 });
+  assert.equal(result.total, 1);
+  assert.equal(categoryPage({ categories: [], uncategorizedCount: 0 }).total, 0);
+});
+
+test('分类切换加载失败后方向键不暴露旧分类，重试恢复选定分类文章', async () => {
+  let available = false;
+  const runtime = createRuntime({ modern: true, request: async (href) => {
+    if (href.endsWith('/read/search')) return json(searchPage([], { kind: 'category', noMatch: true }));
+    if (new URL(href).searchParams.get('category') === 'category-0') {
+      if (!available) throw new Error('network failed');
+      return json({ items: [voiceItem(0)], total: 1, offset: 0, limit: 12 });
+    }
+    return json({ items: [], total: 0, offset: 0, limit: 12, navigation: categoryNavigation(1) });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  await page.search('未知分类');
+  page.openArticle('category-0'); await settle();
+  assert.equal(page.data.canRetry, true);
+  assert.equal(page.libraryPage, null);
+  press(page, 'ArrowDown');
+  assert.equal(page.data.rows.length, 0);
+  assert.equal(page.data.canRetry, true);
+  assert.equal(runtime.navigation.length, 0);
+  available = true;
+  page.retry(); await settle();
+  assert.equal(page.data.selectedId, 'voice-0');
+  assert.equal(page.data.heading, '分类0');
+  assert.equal(runtime.navigation.length, 0);
+});
+
+test('明确文章口令和引用标题以分类结尾时不误入分类回退', async () => {
+  const runtime = createRuntime({ base: null });
+  const { searchDemo } = await runtime.load('lib/search.js');
+  const items = [{ ...voiceItem(0), title: '垃圾分类', category: { id: 'daily', name: '日常' } }];
+  for (const query of ['查找文章垃圾分类', '文章垃圾分类', '查找《垃圾分类》']) {
+    const result = searchDemo(items, query);
+    assert.equal(result.kind, 'article');
+    assert.equal(result.items[0].id, 'voice-0');
+  }
+  assert.equal(searchDemo(items, '查找文章不存在分类').total, 0);
 });

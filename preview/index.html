@@ -21,6 +21,15 @@
             <h2 id="library-title" tabindex="-1">全部文章</h2>
             <span id="article-count" class="quiet"></span>
           </header>
+          <form id="search-form" class="search-form" aria-label="模拟识别文本检索">
+            <label for="search-text" class="quiet">模拟 Rokid 识别文本</label>
+            <div class="search-actions">
+              <input id="search-text" name="query" maxlength="200" placeholder="查看日常分类 / 查找第一班电车之前" required>
+              <button type="submit" class="control">检索</button>
+              <button type="button" id="show-all" class="control">全部</button>
+            </div>
+            <p class="quiet">仅测试虚构内容的匹配流程，不启用麦克风或调用 OpenAI。</p>
+          </form>
           <ol id="article-list" class="article-list"></ol>
           <p id="library-status" class="quiet" role="status">正在加载文章</p>
           <noscript><p>请开启 JavaScript 后重新加载此页。</p></noscript>
@@ -29,7 +38,7 @@
         <section id="reader" class="reader" aria-labelledby="reader-title" hidden>
           <header class="display-header reader-header">
             <button type="button" id="back" class="control back">
-              <span aria-hidden="true">‹</span> 全部文章
+              <span aria-hidden="true">‹</span> 返回列表
             </button>
             <time id="reader-date" class="quiet"></time>
           </header>
