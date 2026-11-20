@@ -1975,6 +1975,129 @@ function searchPage(items, extra = {}) {
 }
 const voiceItem = (index) => ({ id: 'voice-' + index, title: '文章' + index, publishedAt: '2026-11-15', hasAudio: false });
 
+const fuzzyCandidates = Array.from({ length: 5 }, (_, index) =>
+  ({ id: `science-${index}`, name: index ? `科学${index}` : '科', articleCount: index + 1 }));
+const fuzzyCategoryResult = () => searchPage([], { kind: 'category', categoryQuery: '科',
+  categoryCandidates: fuzzyCandidates, noMatch: false, label: '分类：科' });
+
+test('真实分类多候选需按钮翻页和明确选择，隐藏项不打开且读取精确分类id', async () => {
+  const requests = [];
+  const runtime = createRuntime({ modern: true, request: async (href) => {
+    requests.push(href);
+    if (href.endsWith('/read/search')) return json(fuzzyCategoryResult());
+    const category = new URL(href).searchParams.get('category');
+    return json({ items: category ? [voiceItem(0)] : [], total: category ? 1 : 0, offset: 0, limit: 12 });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  await page.search('查看科分类');
+  assert.equal(page.data.categoriesActive, true);
+  assert.equal(page.data.message, '请选择分类');
+  assert.equal(page.data.selectedId, 'science-0');
+  assert.equal(runtime.navigation.length, 0);
+  const before = requests.length;
+  page.openArticle('science-4'); await settle();
+  assert.equal(requests.length, before);
+  page.nextListPage();
+  assert.equal(page.data.selectedId, 'science-3');
+  page.openArticle('science-4'); await settle();
+  assert.equal(new URL(requests.at(-1)).searchParams.get('category'), 'science-4');
+  assert.equal(new URL(requests.at(-1)).searchParams.has('q'), false);
+  assert.equal(page.data.categoriesActive, false);
+  assert.equal(page.data.heading, '科学4');
+  assert.equal(runtime.navigation.length, 0, '分类仅有一篇也不自动打开正文');
+});
+
+test('候选页重开只恢复仍有权限的原候选及次序，换账号清除候选', async () => {
+  let refresh = false;
+  let searches = 0;
+  const runtime = createRuntime({ modern: true, request: async (href) => {
+    if (href.endsWith('/read/search')) { searches++; return json(fuzzyCategoryResult()); }
+    const categories = refresh ? [fuzzyCandidates[4], fuzzyCandidates[0],
+      { id: 'unrelated', name: '无关', articleCount: 1 }] : [];
+    return json({ items: [], total: 0, offset: 0, limit: 12, navigation: { categories, uncategorizedCount: 0 } });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  await page.search('查看科分类');
+  page.nextListPage();
+  page.onHide(); refresh = true;
+  await page.onShow(); await settle();
+  assert.equal(searches, 1, '恢复不重复调用语义检索');
+  assert.deepEqual(Array.from(page.libraryPage.items, (item) => item.id), ['science-0', 'science-4']);
+  assert.equal(page.data.heading, '分类：科');
+  runtime.storage.clear();
+  zhisheng.saveBinding({ ...renewable(), bindingId: 'other-binding', account: { id: 'other-user', displayName: '另一个账号' } });
+  await page.onShow(); await settle();
+  assert.equal(page.data.categoriesActive, false);
+  assert.equal(page.categoryCandidateIds, null);
+});
+
+test('畸形模糊分类响应不得作为空筛选读取全部文章', async () => {
+  let result = fuzzyCategoryResult();
+  const runtime = createRuntime({ modern: true, request: async () => json(result) });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  for (const mutate of [
+    (value) => { value.categoryCandidates = {}; },
+    (value) => { value.categoryCandidates = [fuzzyCandidates[0], fuzzyCandidates[0]]; },
+    (value) => { value.categoryCandidates = [{ ...fuzzyCandidates[0], articleCount: -1 }, fuzzyCandidates[1]]; },
+    (value) => { value.categoryQuery = '科'.repeat(121); },
+    (value) => { delete value.categoryQuery; },
+    (value) => { value.filters.category = 'unexpected'; },
+    (value) => { value.noMatch = true; },
+  ]) {
+    result = fuzzyCategoryResult(); mutate(result);
+    await assert.rejects(zhisheng.searchArticles('查看科分类'), { code: 'bad_response' });
+  }
+});
+
+test('新分类回退等待中隐藏再显示，不以旧候选标题展示无关分类', async () => {
+  const pending = deferred();
+  let unknown = false;
+  let waitingNavigation = false;
+  const runtime = createRuntime({ modern: true, request: async (href) => {
+    if (href.endsWith('/read/search')) return json(unknown
+      ? searchPage([], { kind: 'category', noMatch: true, categoryQuery: '不存在' }) : fuzzyCategoryResult());
+    if (waitingNavigation) return pending.promise;
+    return json({ items: [], total: 0, offset: 0, limit: 12, navigation: {
+      categories: [...fuzzyCandidates, { id: 'unrelated', name: '无关', articleCount: 1 }], uncategorizedCount: 0 } });
+  } });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  await page.search('查看科分类');
+  unknown = true; waitingNavigation = true;
+  const work = page.search('查看不存在分类'); await settle();
+  page.onHide(); waitingNavigation = false;
+  await page.onShow(); await settle();
+  assert.equal(page.data.heading, '分类：科');
+  assert.deepEqual(Array.from(page.libraryPage.items, (item) => item.id), fuzzyCandidates.map((item) => item.id));
+  pending.resolve(json({ items: [], total: 0, offset: 0, limit: 12,
+    navigation: { categories: [], uncategorizedCount: 0 } }));
+  await work;
+  assert.equal(page.data.heading, '分类：科');
+  assert.equal(page.libraryPage.total, 5);
+});
+
+test('已返回全部后迟到的模糊分类候选不能覆盖列表', async () => {
+  const pending = deferred();
+  const runtime = createRuntime({ modern: true, request: async (href) => href.endsWith('/read/search')
+    ? pending.promise : json({ items: [voiceItem(0)], total: 1, offset: 0, limit: 12 }) });
+  const { zhisheng } = await runtime.load('lib/zhisheng.js');
+  zhisheng.saveBinding(renewable());
+  const page = await runtime.page('index'); await settle();
+  const work = page.search('查看科分类');
+  await settle(); page.showAll(); await settle();
+  pending.resolve(json(fuzzyCategoryResult())); await work;
+  assert.equal(page.data.heading, '全部文章');
+  assert.equal(page.data.categoriesActive, false);
+  assert.equal(page.categoryCandidateIds, null);
+  assert.equal(page.data.selectedId, 'voice-0');
+});
+
 test('真实检索唯一文章直接打开，分类分页和重新显示保持同一筛选', async () => {
   const requests = [];
   let category = false;

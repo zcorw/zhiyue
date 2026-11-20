@@ -54,6 +54,7 @@ export default {
     this.searchFilter = null;
     this.searchQuery = '';
     this.searchNoMatch = false;
+    this.categoryCandidateIds = null;
     this.demoResults = null;
     this.speech = createSpeechInput({
       onState: (voiceState, message) => this.setData({ voiceState, message }),
@@ -198,6 +199,12 @@ export default {
       if (this.data.categoriesActive) {
         const library = await zhisheng.listArticles(0, request.signal);
         page = categoryPage(library.navigation);
+        // 重开候选页时重新核对可读分类，保持候选顺序，不再调用语义服务。
+        if (this.categoryCandidateIds) {
+          page.items = this.categoryCandidateIds.map((id) => page.items.find((item) => item.id === id)).filter(Boolean);
+          page.total = page.items.length;
+          page.label = this.data.heading;
+        }
       } else if (this.searchNoMatch) {
         await zhisheng.ensureBinding();
         page = { items: [], total: 0, offset: 0 };
@@ -249,6 +256,7 @@ export default {
     this.searchFilter = null;
     this.searchQuery = '';
     this.searchNoMatch = false;
+    this.categoryCandidateIds = null;
     this.demoResults = null;
     this.setData({ heading: '全部文章', searchActive: false, categoriesActive: false, searchSelected: false, voiceState: 'idle', pageFocus: '' });
   },
@@ -274,11 +282,20 @@ export default {
     try {
       let result = this.data.live ? await zhisheng.searchArticles(text, request.signal) : searchDemo(articles, text);
       if (this.request !== request) return;
-      if (this.data.live && result.kind === 'category' && result.noMatch) {
+      let candidateIds = null;
+      if (this.data.live && result.categoryCandidates) {
+        const label = result.label;
+        result = categoryPage({ categories: result.categoryCandidates, uncategorizedCount: 0 });
+        result.label = label;
+        candidateIds = result.items.map((item) => item.id);
+      } else if (this.data.live && result.kind === 'category' && result.noMatch) {
         const library = await zhisheng.listArticles(0, request.signal);
         if (this.request !== request) return;
         result = categoryPage(library.navigation);
+        result.noMatch = true;
       }
+      // 完整结果就绪后一起替换候选状态，取消中的新检索不能损坏旧候选。
+      this.categoryCandidateIds = candidateIds;
       this.setData({ categoriesActive: result.kind === 'categories' });
       this.searchFilter = result.filters;
       this.searchNoMatch = Boolean(result.noMatch);
@@ -291,7 +308,7 @@ export default {
       if (!this.data.live) this.demoResults = result.items;
       this.setData({ ...this.listView(0, result), heading: result.label, searchActive: result.kind !== 'all',
         searchSelected: false, accountSelected: false,
-        message: result.kind === 'categories' ? (result.total ? '未找到指定分类，请选择分类' : '暂无可用分类，可重新检索或返回全部文章') : result.total ? (result.resolvedBy === 'fallback' ? '语义服务暂不可用 · 已使用基础检索' : '') : '没有找到，可重新检索或返回全部' });
+        message: result.kind === 'categories' ? (result.total ? (result.noMatch ? '未找到指定分类，请选择分类' : '请选择分类') : '暂无可用分类，可重新检索或返回全部文章') : result.total ? (result.resolvedBy === 'fallback' ? '语义服务暂不可用 · 已使用基础检索' : '') : '没有找到，可重新检索或返回全部' });
       if (result.kind === 'article' && result.total === 1) openId = result.items[0].id;
     } catch (error) {
       if (this.request !== request) return;
@@ -422,6 +439,7 @@ export default {
         accountSelected: false, message: '', rows: [], selectedId: '' });
       this.searchFilter = { q: '', category: id };
       this.searchNoMatch = false;
+      this.categoryCandidateIds = null;
       this.resumeSelection = null;
       if (this.data.live) this.loadLibrary(0);
       else {

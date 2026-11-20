@@ -548,6 +548,16 @@ export function createZhishengClient({ origin, storage, request = (...args) => f
           || typeof page.filters?.q !== 'string' || typeof page.filters?.category !== 'string'
           || page.filters.q.length > 120 || page.filters.category.length > 64
           || (page.noMatch !== undefined && typeof page.noMatch !== 'boolean')
+          || (page.categoryQuery !== undefined && (page.kind !== 'category'
+            || typeof page.categoryQuery !== 'string' || page.categoryQuery.length > 120))
+          || (page.categoryCandidates !== undefined && (page.kind !== 'category'
+            || !Array.isArray(page.categoryCandidates) || page.categoryCandidates.length < 2
+            || page.noMatch !== false || page.total !== 0 || page.filters.q || page.filters.category
+            || typeof page.categoryQuery !== 'string' || !page.categoryQuery.trim()
+            || !page.categoryCandidates.every((item) => typeof item?.id === 'string' && item.id.length > 0 && item.id.length <= 64
+              && typeof item.name === 'string' && Boolean(item.name.trim())
+              && Number.isSafeInteger(item.articleCount) && item.articleCount > 0)
+            || new Set(page.categoryCandidates.map((item) => item.id)).size !== page.categoryCandidates.length))
           || typeof page.label !== 'string') throw new ZhishengError('bad_response');
       return page;
     },

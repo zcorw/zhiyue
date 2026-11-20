@@ -247,7 +247,7 @@ byId('search-form').addEventListener('submit', (event) => {
   listStart = 0;
   byId('library-title').textContent = result.label;
   renderLibrary();
-  if (categoriesActive) { libraryStatus.hidden = false; libraryStatus.textContent = result.total ? '未找到指定分类，请选择分类' : '暂无可用分类'; }
+  if (categoriesActive) { libraryStatus.hidden = false; libraryStatus.textContent = result.total ? (result.noMatch ? '未找到指定分类，请选择分类' : '请选择分类') : '暂无可用分类'; }
   else if (!result.total) libraryStatus.textContent = '没有找到，可重新检索或返回全部';
   if (result.kind === 'article' && result.total === 1) openArticle(0);
 });
